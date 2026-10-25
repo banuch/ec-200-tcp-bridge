@@ -5,3 +5,6 @@ venv/
 bridge_log.txt
 *.log
 .env
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal

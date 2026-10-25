@@ -34,10 +34,12 @@ Meter addresses / password live in dlms_reader.py.
 import asyncio
 import binascii
 import json
+import os
 import sys
 import time
 
 import dlms_reader
+from profile_store import ProfileStore
 
 HOST = "0.0.0.0"
 PORT = 5000                 # must match SERVER_PORT in the module script
@@ -49,6 +51,11 @@ LOG_FILE = "bridge_log.txt"
 AUTO_READ_ON_CONNECT = True
 AUTO_READ_DELAY = 1         # seconds after bridge hello before starting DLMS
 AUTO_READ_RETRY = 60        # retry interval after an unsuccessful meter read
+PROFILE_COLLECTION_ENABLED = True
+PROFILE_DB_FILE = os.environ.get(
+    "BRIDGE_PROFILE_DB",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "bridge_data.sqlite3"),
+)
 
 HELLO_PREFIX = b'{"type":"BRIDGE"'
 
@@ -60,6 +67,7 @@ pipe_target = None          # module id for the next PC, None = last connected
 tasks = set()               # running read tasks (keeps references alive)
 auto_tasks = {}             # module id -> automatic read-cycle task
 next_id = 1
+profile_store = ProfileStore(PROFILE_DB_FILE)
 
 
 def log(line):
@@ -77,6 +85,18 @@ def _hex(data):
 def label(cid):
     name = names.get(cid)
     return "#{} ({})".format(cid, name) if name else "#{}".format(cid)
+
+
+def device_key(cid):
+    """Stable storage key until authenticated IMEI identity is introduced."""
+    return names.get(cid) or "connection-{}".format(cid)
+
+
+def start_task(coro):
+    task = asyncio.create_task(coro)
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+    return task
 
 
 def take_hello(cid, data):
@@ -237,8 +257,22 @@ async def read_meter(cid):
     log("DLMS #{}: reading meter...".format(cid))
     success = False
     try:
-        results = await dlms_reader.read_basic(session)
+        results, profiles = await dlms_reader.read_cycle(
+            session,
+            profile_store,
+            device_key(cid),
+            include_profiles=PROFILE_COLLECTION_ENABLED,
+        )
         log(dlms_reader.format_results(cid, results))
+        for result in profiles:
+            if result["status"] == "complete":
+                log("PROFILE {} {}: read={}, new={}".format(
+                    label(cid), result["obis"], result["rows_read"],
+                    result["rows_inserted"]))
+            else:
+                log("PROFILE {} {}: {} ({})".format(
+                    label(cid), result["obis"], result["status"],
+                    result.get("error", "no details")))
         success = True
     except dlms_reader.LinkClosed:
         log("DLMS #{}: module disconnected during read".format(cid))
@@ -247,6 +281,54 @@ async def read_meter(cid):
     finally:
         sessions.pop(cid, None)
     return success
+
+
+async def scan_meter_profiles(cid):
+    entry = clients.get(cid)
+    if not entry:
+        print("No such module:", cid)
+        return
+    if cid in sessions or cid in pc_links:
+        print("Module {} is busy".format(cid))
+        return
+    session = dlms_reader.MeterSession(cid, entry[1], log)
+    sessions[cid] = session
+    try:
+        profiles, _ = await dlms_reader.scan_profiles(
+            session, profile_store, device_key(cid)
+        )
+        log("Association View {}: {} Profile Generic object(s)".format(
+            label(cid), len(profiles)))
+        for profile in profiles:
+            log("  {} {:<8} enabled={}".format(
+                profile["obis"], profile["profile_type"], bool(profile["enabled"])))
+    except Exception as error:
+        log("Association View {} failed: {!r}".format(label(cid), error))
+    finally:
+        sessions.pop(cid, None)
+
+
+async def read_meter_profile(cid, obis, mode, values):
+    entry = clients.get(cid)
+    if not entry:
+        print("No such module:", cid)
+        return
+    if cid in sessions or cid in pc_links:
+        print("Module {} is busy".format(cid))
+        return
+    session = dlms_reader.MeterSession(cid, entry[1], log)
+    sessions[cid] = session
+    try:
+        result = await dlms_reader.read_profile_manual(
+            session, profile_store, device_key(cid), obis, mode, values
+        )
+        log("PROFILE {} {}: read={}, new={}".format(
+            label(cid), obis, result["rows_read"], result["rows_inserted"]))
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    except Exception as error:
+        log("PROFILE {} {} failed: {!r}".format(label(cid), obis, error))
+    finally:
+        sessions.pop(cid, None)
 
 
 async def auto_read_cycle(cid):
@@ -280,6 +362,11 @@ async def console():
     global pipe_target
     loop = asyncio.get_running_loop()
     print("Commands: list | send <id> <hex> | sendtext <id> <text> | read <id> | "
+          "objects <id> | profiles <id> | profile-status <id> | "
+          "readprofile <id> <obis> last <count> | "
+          "readprofile <id> <obis> entry <start> <count> | "
+          "readprofile <id> <obis> range <from> <to> | "
+          "enableprofile|disableprofile <id> <obis> | "
           "pipe <id>|off | kick <id> | quit")
     while True:
         line = await loop.run_in_executor(None, sys.stdin.readline)
@@ -287,6 +374,7 @@ async def console():
             await asyncio.sleep(1)
             continue
         parts = line.strip().split(None, 2)
+        args = line.strip().split()
         if not parts:
             continue
         cmd = parts[0].lower()
@@ -311,9 +399,33 @@ async def console():
                 text = parts[2].encode().decode("unicode_escape").encode()
                 await send_to(int(parts[1]), text)
             elif cmd == "read" and len(parts) >= 2:
-                task = asyncio.create_task(read_meter(int(parts[1])))
-                tasks.add(task)
-                task.add_done_callback(tasks.discard)
+                start_task(read_meter(int(parts[1])))
+            elif cmd in ("objects", "profiles") and len(args) == 2:
+                start_task(scan_meter_profiles(int(args[1])))
+            elif cmd == "profile-status" and len(args) == 2:
+                cid = int(args[1])
+                status = profile_store.list_status(device_key(cid))
+                if not status:
+                    print("(no cached profiles; run profiles {})".format(cid))
+                for item in status:
+                    print("  {obis}  {profile_type:<8} enabled={enabled} "
+                          "status={status} entries={entries_in_use} last={last_capture_at}".format(
+                              **item))
+            elif cmd == "readprofile" and len(args) >= 5:
+                cid = int(args[1])
+                mode = args[3].lower()
+                expected = 5 if mode == "last" else 6
+                if len(args) != expected or mode not in ("last", "entry", "range"):
+                    raise ValueError("invalid readprofile arguments")
+                start_task(read_meter_profile(cid, args[2], mode, args[4:]))
+            elif cmd in ("enableprofile", "disableprofile") and len(args) == 3:
+                cid = int(args[1])
+                enabled = cmd == "enableprofile"
+                if profile_store.set_profile_enabled(device_key(cid), args[2], enabled):
+                    print("{} {} for {}".format(
+                        "Enabled" if enabled else "Disabled", args[2], label(cid)))
+                else:
+                    print("Unknown cached profile; run profiles", cid)
             elif cmd == "kick" and len(parts) >= 2:
                 entry = clients.get(int(parts[1]))
                 if entry:
@@ -342,3 +454,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, RuntimeError):
         print("\nStopped.")
+    finally:
+        profile_store.close()

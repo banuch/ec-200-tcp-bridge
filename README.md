@@ -11,6 +11,8 @@ server through a Quectel EC200U running QuecPython.
 - `device/serial_*` and `device/uart_port_scan_test.py` - UART/DB9 tests.
 - `server/server.py` - asyncio TCP server and automatic reading scheduler.
 - `server/dlms_reader.py` - Gurux DLMS session and OBIS reads.
+- `server/profile_store.py` - SQLite storage for discovered Profile Generic
+  metadata, rows and incremental synchronization state.
 - `tools/` - PC, dummy-meter and early TCP diagnostic utilities.
 
 ## Hardware configuration
@@ -51,6 +53,35 @@ Set `SERVER_HOST`, `SERVER_PORT` and `DEVICE_ID` near the top of
 
 The server automatically starts reading after a valid bridge hello; the
 manual `read <id>` command remains available for diagnostics.
+
+## Association View and profile data
+
+The server discovers class-ID 7 Profile Generic objects from the meter's
+Association View. Known load, daily, billing and event profiles are collected
+incrementally; unknown manufacturer-specific profiles are cached but disabled
+until explicitly enabled. Profile rows are stored in
+`server/bridge_data.sqlite3` by default. Set `BRIDGE_PROFILE_DB` to use a
+different path.
+
+Automatic reads are bounded to 50 rows per request, 200 rows and 1 MiB per
+connection, and a 120-second profile budget. Full profile buffers are never
+downloaded automatically. The first synchronization reads only a recent
+window: 96 load rows, seven daily rows, three billing rows and 100 event rows.
+
+Useful server-console commands:
+
+```text
+profiles <id>
+profile-status <id>
+readprofile <id> <obis> last <count>
+readprofile <id> <obis> entry <start> <count>
+readprofile <id> <obis> range <from-iso-time> <to-iso-time>
+enableprofile <id> <obis>
+disableprofile <id> <obis>
+```
+
+Time-range reads are accepted only for clock-sorted profiles with a non-zero
+capture period, and the requested range must fit within the 200-row limit.
 
 ## Useful checks
 
