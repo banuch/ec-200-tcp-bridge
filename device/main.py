@@ -47,13 +47,17 @@ UART_PARITY = 0         # 0=None, 1=Even, 2=Odd
 UART_STOP_BITS = 1
 UART_FLOW_CONTROL = 0
 
-METER_REPLY_TIMEOUT_MS = 3000   # wait this long for the first reply byte
-FRAME_GAP_MS = 50               # this much silence ends the reply
+# Reply timing from the working dlms_uart_probe.py. Keep the timeout under
+# the server's 5 s DLMS WAIT_TIME so a missing reply is retried cleanly.
+METER_REPLY_TIMEOUT_MS = 4000   # wait this long for the meter's HDLC frame
+FRAME_GAP_MS = 200              # this much silence ends the reply
 MAX_CHUNK = 1024
 TRACE_HEX = True
 
-# GPIO4 = DTR, held HIGH for the meter interface
-DTR_LEVEL = 1
+# GPIO4 = DTR to the meter. Asserted only while the Vultr server is
+# connected (like a modem during a call), released between reads.
+DTR_ACTIVE = 1          # GPIO level that asserts DTR; 0 if the line is inverted
+DTR_SETTLE_MS = 1000    # meter port wake time after DTR goes active (as the probe)
 
 # Connection LED on GPIO8: ON while a client is connected
 LED_ON = 1              # set to 0 if the LED is wired active-low
@@ -66,7 +70,7 @@ connection_count = 0
 # -----------------------------------------
 
 try:
-    dtr_pin = Pin(Pin.GPIO4, Pin.OUT, Pin.PULL_DISABLE, DTR_LEVEL)
+    dtr_pin = Pin(Pin.GPIO4, Pin.OUT, Pin.PULL_DISABLE, 1 - DTR_ACTIVE)
 except Exception as e:
     dtr_pin = None
     print("GPIO4 DTR init failed:", e)
@@ -87,13 +91,19 @@ def set_conn_led(on):
         print("GPIO8 LED write failed:", e)
 
 
-def keep_dtr_high():
+def set_dtr(active, quiet=False):
+    # Drive GPIO4; logs only when the level actually changes
     if dtr_pin is None:
         return
+    level = DTR_ACTIVE if active else 1 - DTR_ACTIVE
     try:
-        if dtr_pin.read() != DTR_LEVEL:
-            dtr_pin.write(DTR_LEVEL)
-            print("DTR GPIO4 restored HIGH")
+        if dtr_pin.read() != level:
+            dtr_pin.write(level)
+            if not quiet:
+                print("DTR GPIO4", "ON" if active else "OFF",
+                      "(level %d)" % level)
+            elif active:
+                print("DTR GPIO4 restored ON")
     except Exception as e:
         print("GPIO4 DTR write failed:", e)
 
@@ -214,19 +224,18 @@ def uart_write_all(uart, data):
 
 
 def read_meter_reply(uart):
-    # Wait up to METER_REPLY_TIMEOUT_MS for the first byte, then collect
-    # until FRAME_GAP_MS of silence or MAX_CHUNK bytes.
+    # Same timing as the working dlms_uart_probe.py: wait up to
+    # METER_REPLY_TIMEOUT_MS for data, then collect until FRAME_GAP_MS of
+    # silence. A noise byte right after the request (seen as 00/FC/FE in
+    # testing) is NOT the reply: bytes before the first 0x7E flag are
+    # dropped, and if a burst has no 0x7E at all we keep waiting for the
+    # real HDLC frame.
     started = utime.ticks_ms()
+    reply = bytearray()
+    last_rx = started
 
-    while uart.any() == 0:
-        if utime.ticks_diff(utime.ticks_ms(), started) > METER_REPLY_TIMEOUT_MS:
-            return None
-        utime.sleep_ms(5)
-
-    reply = b""
-    last_rx = utime.ticks_ms()
-
-    while utime.ticks_diff(utime.ticks_ms(), last_rx) < FRAME_GAP_MS:
+    while True:
+        now = utime.ticks_ms()
         available = uart.any()
 
         if available:
@@ -237,12 +246,33 @@ def read_meter_reply(uart):
             data = uart.read(min(available, room))
 
             if data:
-                reply += data
+                reply.extend(data)
                 last_rx = utime.ticks_ms()
-        else:
-            utime.sleep_ms(2)
 
-    return reply if reply else None
+        elif reply and utime.ticks_diff(now, last_rx) >= FRAME_GAP_MS:
+            if 0x7E in reply:
+                break
+
+            # Only noise so far: drop it and keep waiting for the frame
+            trace("NOISE (dropped)", bytes(reply))
+            reply = bytearray()
+
+        elif utime.ticks_diff(now, started) >= METER_REPLY_TIMEOUT_MS:
+            break
+
+        else:
+            utime.sleep_ms(5)
+
+    if 0x7E not in reply:
+        if reply:
+            trace("NOISE (dropped)", bytes(reply))
+        return None
+
+    start = reply.index(0x7E)
+    if start:
+        trace("NOISE (dropped)", bytes(reply[:start]))
+
+    return bytes(reply[start:])
 
 
 def drain_uart(uart):
@@ -269,7 +299,7 @@ def bridge(client, uart, ipv6):
     last_request = utime.ticks_ms()
 
     while True:
-        keep_dtr_high()
+        set_dtr(True, quiet=True)   # keep DTR asserted for the whole session
 
         request = recv_request(client)
 
@@ -357,6 +387,11 @@ def serve(ipv6, uart):
                   "(connection", connection_count, ")")
 
             try:
+                # Assert DTR for this session and let the meter port wake.
+                # Requests that arrive meanwhile wait in the TCP buffer.
+                set_dtr(True)
+                utime.sleep_ms(DTR_SETTLE_MS)
+
                 bridge(client, uart, ipv6)
 
             except ClientClosed as e:
@@ -376,10 +411,12 @@ def serve(ipv6, uart):
                 except:
                     pass
 
+                set_dtr(False)
                 set_conn_led(False)
                 print("CLIENT CLOSED")
 
     finally:
+        set_dtr(False)
         set_conn_led(False)
         try:
             server.close()
@@ -402,7 +439,8 @@ def main():
         UART_FLOW_CONTROL
     )
     print("Meter UART2: 9600 8N1")
-    keep_dtr_high()
+    set_dtr(False)
+    print("DTR GPIO4 OFF until a client connects")
 
     while True:
         try:

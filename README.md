@@ -21,7 +21,8 @@ server through a Quectel EC200U running QuecPython.
 - Module: Quectel EC200U with QuecPython.
 - Meter serial port: `UART.UART2`, 9600 baud, 8N1.
 - DB9 RS-232: pin 2 RX, pin 3 TX and pin 5 GND.
-- GPIO4/DTR is configured as an output and held HIGH.
+- GPIO4 drives the meter DTR: HIGH while the server is connected, LOW
+  between reads (`DTR_ACTIVE` in `device/main.py` inverts it).
 - Cellular PDP context must provide IPv6 connectivity.
 
 ## How the link works
