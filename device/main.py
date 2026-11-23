@@ -223,6 +223,16 @@ def uart_write_all(uart, data):
     return total
 
 
+def find_flag(buf):
+    # Index of the first HDLC 0x7E flag, or -1. Plain loop on purpose:
+    # "0x7E in bytearray" / .index(0x7E) failed on the EC200U with an
+    # exception that had an empty message.
+    for i in range(len(buf)):
+        if buf[i] == 0x7E:
+            return i
+    return -1
+
+
 def read_meter_reply(uart):
     # Same timing as the working dlms_uart_probe.py: wait up to
     # METER_REPLY_TIMEOUT_MS for data, then collect until FRAME_GAP_MS of
@@ -250,7 +260,7 @@ def read_meter_reply(uart):
                 last_rx = utime.ticks_ms()
 
         elif reply and utime.ticks_diff(now, last_rx) >= FRAME_GAP_MS:
-            if 0x7E in reply:
+            if find_flag(reply) >= 0:
                 break
 
             # Only noise so far: drop it and keep waiting for the frame
@@ -263,12 +273,13 @@ def read_meter_reply(uart):
         else:
             utime.sleep_ms(5)
 
-    if 0x7E not in reply:
+    start = find_flag(reply)
+
+    if start < 0:
         if reply:
             trace("NOISE (dropped)", bytes(reply))
         return None
 
-    start = reply.index(0x7E)
     if start:
         trace("NOISE (dropped)", bytes(reply[:start]))
 
@@ -401,7 +412,7 @@ def serve(ipv6, uart):
                 raise
 
             except Exception as e:
-                print("BRIDGE ERROR:", e)
+                print("BRIDGE ERROR:", type(e).__name__, e)
                 if get_ipv6() != ipv6:
                     raise
 
