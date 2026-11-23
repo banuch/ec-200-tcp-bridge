@@ -1,33 +1,42 @@
 """
-bridge_server.py - TCP server for the field bridges (QuecPython module or
-ESP32 serial_tcp_bridge in cellular mode).
+server.py - DLMS reader for EC200U bridges running in TCP-server mode.
 
 Run on your PC / VM:   python server.py
 Needs Python 3.8+ and gurux-dlms (pip install -r requirements.txt).
 
 What it does
- - Listens for modules connecting from the field on PORT.
- - An ESP32 bridge first sends one hello line
-       {"type":"BRIDGE","deviceId":"ESP-xxxxxx"}
-   which is used as the module's name and not passed on.
- - Logs every chunk received from a meter (hex + ASCII) to the console and bridge_log.txt.
- - Automatically reads a meter after its bridge hello. After a successful
-   read and DLMS disconnect, the server closes TCP so the field module can
-   wait for its next scheduled cycle.
+ - Each EC200U listens on its own IPv6 address, TCP port 5000
+   (device/main.py). This server CONNECTS OUT to every configured module.
+ - Modules are listed in modules.json next to this file:
+       {"EC200U_001": {"host": "2401:4900:9864:a48c::2", "port": 5000}}
+   The module prints its IPv6 address at boot ("IPv6: ..."). When the
+   operator gives it a new address, update it with the "setmodule" command
+   (saved to modules.json) - no restart needed.
+ - Every READ_INTERVAL seconds per module: connect, run the DLMS read
+   (identity, values and bounded profile collection), disconnect.
+   A failed connect retries after CONNECT_RETRY, a failed read after
+   AUTO_READ_RETRY.
+ - Logs every chunk received from a meter (hex + ASCII) to the console and
+   bridge_log.txt.
  - PC relay on PC_PORT: a PC tool (Gurux Director: Media Net, TCP, host =
    this server, port = PC_PORT, interface HDLC) is piped byte-for-byte to one
-   module. The target is the module chosen with "pipe <id>", else the module
-   that connected last. One PC per module; no DLMS read while a PC is piped.
- - Lets you type commands to send bytes to a meter through its module:
+   module. The target is the module chosen with "pipe <name>", else the
+   module connected last, else the only configured module. The server opens
+   the connection to the module if it is not open yet.
+ - Console commands:
 
-       list                       show connected modules
-       send <id> <hex bytes>      e.g.  send 1 7EA00A00020023219349E27E
-       sendtext <id> <text>       send plain text (\\r \\n escapes allowed)
-       read <id>                  DLMS: connect and read basic meter details
-       pipe <id>                  route the next PC connection to module <id>
-       pipe off                   back to "module that connected last"
-       kick <id>                  disconnect a module
-       quit                       stop the server
+       modules                       configured modules and their state
+       setmodule <name> <ipv6> [port]  add a module or change its address
+       delmodule <name>              remove a module
+       connect <name>                open a link (for send / read testing)
+       poll <name>                   run one scheduled read now
+       list                          open links (ids used below)
+       send <id> <hex bytes>         e.g.  send 1 7EA00A00020023219349E27E
+       sendtext <id> <text>          send plain text (\\r \\n escapes allowed)
+       read <id>                     DLMS: read meter details on an open link
+       pipe <name>|off               route the next PC connection
+       kick <id>                     close a link
+       quit                          stop the server
 
 Meter addresses / password live in dlms_reader.py.
 """
@@ -35,37 +44,48 @@ import asyncio
 import binascii
 import json
 import os
+import socket
 import sys
 import time
 
 import dlms_reader
 from profile_store import ProfileStore
 
-HOST = "0.0.0.0"
-PORT = 5000                 # must match SERVER_PORT in the module script
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+MODULE_PORT = 5000          # default port the EC200U listens on (device PORT)
+MODULES_FILE = os.environ.get("BRIDGE_MODULES", os.path.join(HERE, "modules.json"))
+DEFAULT_MODULES = {
+    # Used only when modules.json does not exist yet.
+    "EC200U_001": {"host": "2401:4900:9864:a48c::2", "port": MODULE_PORT},
+}
+
+PC_HOST = "::"              # PC relay listens on all IPv6 interfaces
 PC_PORT = 4059              # PC tools connect here to reach a module
 PC_ALLOW = []               # PC IPs allowed on PC_PORT, e.g. ["1.2.3.4"]; [] = any
-IDLE_TIMEOUT = 600          # seconds without data before dropping a module / PC
+
+CONNECT_TIMEOUT = 20        # seconds to wait for the module to accept
+IDLE_TIMEOUT = 600          # seconds without data before dropping a link / PC
+READ_INTERVAL = 15 * 60     # seconds between scheduled reads of a module
+CONNECT_RETRY = 60          # retry after the module could not be reached
+AUTO_READ_RETRY = 60        # retry after an unsuccessful meter read
+AUTO_READ_DELAY = 1         # seconds after connecting before starting DLMS
+STARTUP_STAGGER = 5         # seconds between first reads of several modules
 RELAY_TRACE = True          # log relayed bytes in hex
 LOG_FILE = "bridge_log.txt"
-AUTO_READ_ON_CONNECT = True
-AUTO_READ_DELAY = 1         # seconds after bridge hello before starting DLMS
-AUTO_READ_RETRY = 60        # retry interval after an unsuccessful meter read
 PROFILE_COLLECTION_ENABLED = True
 PROFILE_DB_FILE = os.environ.get(
-    "BRIDGE_PROFILE_DB",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "bridge_data.sqlite3"),
-)
+    "BRIDGE_PROFILE_DB", os.path.join(HERE, "bridge_data.sqlite3"))
 
-HELLO_PREFIX = b'{"type":"BRIDGE"'
-
-clients = {}                # id -> (reader, writer, addr)
-names = {}                  # id -> deviceId from the bridge hello
-sessions = {}               # id -> MeterSession while a DLMS read is running
-pc_links = {}               # module id -> writer of the PC piped to it
-pipe_target = None          # module id for the next PC, None = last connected
-tasks = set()               # running read tasks (keeps references alive)
-auto_tasks = {}             # module id -> automatic read-cycle task
+modules = {}                # name -> {"host": ..., "port": ...}
+clients = {}                # link id -> (reader, writer, addr)
+names = {}                  # link id -> module name
+sessions = {}               # link id -> MeterSession while a DLMS read is running
+pc_links = {}               # link id -> writer of the PC piped to it
+pipe_target = None          # module name for the next PC, None = automatic
+schedulers = {}             # module name -> scheduler task
+link_locks = {}             # module name -> asyncio.Lock (one connect at a time)
+tasks = set()               # running background tasks (keeps references alive)
 next_id = 1
 profile_store = ProfileStore(PROFILE_DB_FILE)
 
@@ -88,7 +108,7 @@ def label(cid):
 
 
 def device_key(cid):
-    """Stable storage key until authenticated IMEI identity is introduced."""
+    """Storage key for profile data: the module name."""
     return names.get(cid) or "connection-{}".format(cid)
 
 
@@ -99,53 +119,94 @@ def start_task(coro):
     return task
 
 
-def take_hello(cid, data):
-    """Strip a valid bridge hello; return (remaining_data, is_bridge)."""
-    if not data.startswith(HELLO_PREFIX) or b"\n" not in data:
-        return data, False
-    line, rest = data.split(b"\n", 1)
-    try:
-        hello = json.loads(line.decode())
-        if hello.get("type") != "BRIDGE":
-            return data, False
-        names[cid] = str(hello.get("deviceId", ""))
-        log("Module #{} is bridge {}".format(cid, names[cid]))
-    except (ValueError, UnicodeDecodeError, AttributeError):
-        return data, False
-    return rest, True
+# ---------------------------------------------------------------------------
+# Module list (modules.json)
+# ---------------------------------------------------------------------------
 
+def load_modules():
+    if not os.path.exists(MODULES_FILE):
+        modules.update(DEFAULT_MODULES)
+        save_modules()
+        log("Created {} with the default module list".format(MODULES_FILE))
+        return
+    with open(MODULES_FILE, encoding="utf-8") as f:
+        data = json.load(f)
+    for name, entry in data.items():
+        modules[name] = {
+            "host": str(entry["host"]).strip("[]"),
+            "port": int(entry.get("port", MODULE_PORT)),
+        }
+
+
+def save_modules():
+    tmp = MODULES_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(modules, f, indent=2)
+    os.replace(tmp, MODULES_FILE)
+
+
+def live_cid(name):
+    """Open link id for a module name, or None."""
+    for cid, n in names.items():
+        if n == name and cid in clients:
+            return cid
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Links to modules (the server is the TCP client)
+# ---------------------------------------------------------------------------
 
 def handle_data(cid, addr, data):
-    """Called for every chunk a meter sends. Put DLMS parsing here."""
+    """Called for every chunk a meter sends outside a DLMS read or PC pipe."""
     hexs = binascii.hexlify(data, " ").decode().upper()
     ascii_ = "".join(chr(b) if 32 <= b < 127 else "." for b in data)
     log("RX #{} {} ({} bytes)\n    HEX  : {}\n    ASCII: {}".format(
         cid, addr, len(data), hexs, ascii_))
 
 
-async def handle_client(reader, writer):
-    global next_id
-    cid = next_id
-    next_id += 1
-    addr = writer.get_extra_info("peername")
-    clients[cid] = (reader, writer, addr)
-    log("Module #{} connected from {}".format(cid, addr))
-    first = True
+async def open_link(name):
+    """Connect to a module (or reuse an open link); return the link id."""
+    lock = link_locks.setdefault(name, asyncio.Lock())
+    async with lock:
+        cid = live_cid(name)
+        if cid is not None:
+            return cid
+        entry = modules.get(name)
+        if not entry:
+            raise ValueError("unknown module {}".format(name))
+
+        global next_id
+        log("Connecting to module {} at [{}]:{}".format(
+            name, entry["host"], entry["port"]))
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(entry["host"], entry["port"],
+                                    family=socket.AF_INET6),
+            CONNECT_TIMEOUT)
+
+        cid = next_id
+        next_id += 1
+        addr = writer.get_extra_info("peername")
+        clients[cid] = (reader, writer, addr)
+        names[cid] = name
+        log("Module {} connected at {}".format(label(cid), addr))
+        start_task(module_reader(cid, reader, writer, addr))
+        return cid
+
+
+def close_link(cid):
+    entry = clients.get(cid)
+    if entry:
+        entry[1].close()
+
+
+async def module_reader(cid, reader, writer, addr):
+    """Route everything the module sends until the link closes."""
     try:
         while True:
             data = await asyncio.wait_for(reader.read(2048), IDLE_TIMEOUT)
             if not data:
                 break
-            if first:
-                first = False
-                data, is_bridge = take_hello(cid, data)
-                if is_bridge and AUTO_READ_ON_CONNECT:
-                    task = asyncio.create_task(auto_read_cycle(cid))
-                    auto_tasks[cid] = task
-                    tasks.add(task)
-                    task.add_done_callback(tasks.discard)
-                if not data:
-                    continue
             pc = pc_links.get(cid)
             session = sessions.get(cid)
             if pc:
@@ -161,13 +222,10 @@ async def handle_client(reader, writer):
             else:
                 handle_data(cid, addr, data)
     except asyncio.TimeoutError:
-        log("Module {} idle for {}s, dropping".format(label(cid), IDLE_TIMEOUT))
-    except (ConnectionResetError, BrokenPipeError):
+        log("Link {} idle for {}s, closing".format(label(cid), IDLE_TIMEOUT))
+    except (ConnectionResetError, BrokenPipeError, OSError):
         pass
     finally:
-        task = auto_tasks.pop(cid, None)
-        if task and not task.done():
-            task.cancel()
         session = sessions.get(cid)
         if session:
             session.feed(None)          # abort a running read
@@ -176,15 +234,75 @@ async def handle_client(reader, writer):
             pc.close()                  # the PC sees the meter link drop
         clients.pop(cid, None)
         writer.close()
-        log("Module {} disconnected".format(label(cid)))
+        log("Link {} closed".format(label(cid)))
         names.pop(cid, None)
 
 
-def pick_module():
+# ---------------------------------------------------------------------------
+# Scheduled reads
+# ---------------------------------------------------------------------------
+
+async def poll_once(name):
+    """Connect, read the meter, disconnect. Returns seconds until next try."""
+    if name not in modules:
+        return None
+    try:
+        cid = await open_link(name)
+    except (OSError, asyncio.TimeoutError, ValueError) as error:
+        log("Module {} not reachable: {!r}; retrying in {}s".format(
+            name, error, CONNECT_RETRY))
+        return CONNECT_RETRY
+
+    if cid in pc_links or cid in sessions:
+        log("Module {} busy (PC or read running); retrying in {}s".format(
+            label(cid), AUTO_READ_RETRY))
+        return AUTO_READ_RETRY
+
+    await asyncio.sleep(AUTO_READ_DELAY)
+    success = await read_meter(cid)
+    close_link(cid)
+
+    if success:
+        log("Scheduled read {} complete; next in {}s".format(name, READ_INTERVAL))
+        return READ_INTERVAL
+    log("Scheduled read {} unsuccessful; retrying in {}s".format(
+        name, AUTO_READ_RETRY))
+    return AUTO_READ_RETRY
+
+
+async def scheduler(name, first_delay):
+    try:
+        await asyncio.sleep(first_delay)
+        while name in modules:
+            delay = await poll_once(name)
+            if delay is None:
+                return
+            await asyncio.sleep(delay)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        if schedulers.get(name) is asyncio.current_task():
+            schedulers.pop(name, None)
+
+
+def start_scheduler(name, first_delay=0):
+    if name not in schedulers:
+        schedulers[name] = start_task(scheduler(name, first_delay))
+
+
+# ---------------------------------------------------------------------------
+# PC relay
+# ---------------------------------------------------------------------------
+
+def pick_module_name():
     """Module for a new PC connection, or None."""
     if pipe_target is not None:
-        return pipe_target if pipe_target in clients else None
-    return max(clients) if clients else None
+        return pipe_target
+    if clients:
+        return names.get(max(clients))
+    if len(modules) == 1:
+        return next(iter(modules))
+    return None
 
 
 async def handle_pc(reader, writer):
@@ -193,12 +311,23 @@ async def handle_pc(reader, writer):
         log("PC {} refused: not in PC_ALLOW".format(addr))
         writer.close()
         return
-    cid = pick_module()
+
+    name = pick_module_name()
+    if name is None:
+        log("PC {} refused: several modules configured; use pipe <name>".format(addr))
+        writer.close()
+        return
+
+    opened_here = live_cid(name) is None
+    try:
+        cid = await open_link(name)
+    except (OSError, asyncio.TimeoutError, ValueError) as error:
+        log("PC {} refused: module {} not reachable: {!r}".format(addr, name, error))
+        writer.close()
+        return
+
     reason = None
-    if cid is None:
-        reason = "no module connected" if pipe_target is None else \
-            "module #{} not connected".format(pipe_target)
-    elif cid in pc_links:
+    if cid in pc_links:
         reason = "module {} already has a PC".format(label(cid))
     elif cid in sessions:
         reason = "a DLMS read is running on module {}".format(label(cid))
@@ -206,6 +335,7 @@ async def handle_pc(reader, writer):
         log("PC {} refused: {}".format(addr, reason))
         writer.close()
         return
+
     pc_links[cid] = writer
     module_writer = clients[cid][1]
     log("PC {} piped to module {}".format(addr, label(cid)))
@@ -227,12 +357,18 @@ async def handle_pc(reader, writer):
             del pc_links[cid]
         writer.close()
         log("PC {} disconnected".format(addr))
+        if opened_here:
+            close_link(cid)
 
+
+# ---------------------------------------------------------------------------
+# DLMS operations on an open link
+# ---------------------------------------------------------------------------
 
 async def send_to(cid, payload):
     entry = clients.get(cid)
     if not entry:
-        print("No such module:", cid)
+        print("No such link:", cid)
         return
     _, writer, addr = entry
     writer.write(payload)
@@ -244,17 +380,17 @@ async def send_to(cid, payload):
 async def read_meter(cid):
     entry = clients.get(cid)
     if not entry:
-        print("No such module:", cid)
+        print("No such link:", cid)
         return False
     if cid in sessions:
-        print("A read is already running on module", cid)
+        print("A read is already running on link", cid)
         return False
     if cid in pc_links:
-        print("A PC is piped to module", cid)
+        print("A PC is piped to link", cid)
         return False
     session = dlms_reader.MeterSession(cid, entry[1], log)
     sessions[cid] = session
-    log("DLMS #{}: reading meter...".format(cid))
+    log("DLMS {}: reading meter...".format(label(cid)))
     success = False
     try:
         results, profiles = await dlms_reader.read_cycle(
@@ -275,9 +411,9 @@ async def read_meter(cid):
                     result.get("error", "no details")))
         success = True
     except dlms_reader.LinkClosed:
-        log("DLMS #{}: module disconnected during read".format(cid))
+        log("DLMS {}: module disconnected during read".format(label(cid)))
     except Exception as e:
-        log("DLMS #{}: read failed: {!r}".format(cid, e))
+        log("DLMS {}: read failed: {!r}".format(label(cid), e))
     finally:
         sessions.pop(cid, None)
     return success
@@ -286,10 +422,10 @@ async def read_meter(cid):
 async def scan_meter_profiles(cid):
     entry = clients.get(cid)
     if not entry:
-        print("No such module:", cid)
+        print("No such link:", cid)
         return
     if cid in sessions or cid in pc_links:
-        print("Module {} is busy".format(cid))
+        print("Link {} is busy".format(cid))
         return
     session = dlms_reader.MeterSession(cid, entry[1], log)
     sessions[cid] = session
@@ -311,10 +447,10 @@ async def scan_meter_profiles(cid):
 async def read_meter_profile(cid, obis, mode, values):
     entry = clients.get(cid)
     if not entry:
-        print("No such module:", cid)
+        print("No such link:", cid)
         return
     if cid in sessions or cid in pc_links:
-        print("Module {} is busy".format(cid))
+        print("Link {} is busy".format(cid))
         return
     session = dlms_reader.MeterSession(cid, entry[1], log)
     sessions[cid] = session
@@ -331,43 +467,42 @@ async def read_meter_profile(cid, obis, mode, values):
         sessions.pop(cid, None)
 
 
-async def auto_read_cycle(cid):
-    """Read until successful, then close TCP to start the module's timer."""
+async def connect_command(name):
     try:
-        await asyncio.sleep(AUTO_READ_DELAY)
+        cid = await open_link(name)
+        print("Module {} open as link {}".format(name, cid))
+    except (OSError, asyncio.TimeoutError, ValueError) as error:
+        log("Connect {} failed: {!r}".format(name, error))
 
-        while cid in clients:
-            success = await read_meter(cid)
-            if success:
-                entry = clients.get(cid)
-                if entry:
-                    log("Automatic read {} complete; closing TCP for next cycle".format(
-                        label(cid)))
-                    entry[1].close()
-                return
 
-            if cid in clients:
-                log("Automatic read {} unsuccessful; retrying in {}s".format(
-                    label(cid), AUTO_READ_RETRY))
-                await asyncio.sleep(AUTO_READ_RETRY)
-    except asyncio.CancelledError:
-        pass
-    finally:
-        current = asyncio.current_task()
-        if auto_tasks.get(cid) is current:
-            auto_tasks.pop(cid, None)
+async def poll_command(name):
+    await poll_once(name)
+
+
+# ---------------------------------------------------------------------------
+# Console
+# ---------------------------------------------------------------------------
+
+def print_modules():
+    if not modules:
+        print("(no modules configured; use setmodule <name> <ipv6>)")
+    for name, entry in modules.items():
+        cid = live_cid(name)
+        state = "link {}".format(cid) if cid is not None else "not connected"
+        print("  {:<14} [{}]:{}  {}".format(name, entry["host"], entry["port"], state))
 
 
 async def console():
     global pipe_target
     loop = asyncio.get_running_loop()
-    print("Commands: list | send <id> <hex> | sendtext <id> <text> | read <id> | "
-          "objects <id> | profiles <id> | profile-status <id> | "
-          "readprofile <id> <obis> last <count> | "
+    print("Commands: modules | setmodule <name> <ipv6> [port] | delmodule <name> | "
+          "connect <name> | poll <name> | list | send <id> <hex> | "
+          "sendtext <id> <text> | read <id> | objects <id> | profiles <id> | "
+          "profile-status <id> | readprofile <id> <obis> last <count> | "
           "readprofile <id> <obis> entry <start> <count> | "
           "readprofile <id> <obis> range <from> <to> | "
           "enableprofile|disableprofile <id> <obis> | "
-          "pipe <id>|off | kick <id> | quit")
+          "pipe <name>|off | kick <id> | quit")
     while True:
         line = await loop.run_in_executor(None, sys.stdin.readline)
         if not line:
@@ -379,19 +514,44 @@ async def console():
             continue
         cmd = parts[0].lower()
         try:
-            if cmd == "list":
+            if cmd == "modules":
+                print_modules()
+            elif cmd == "setmodule" and len(args) in (3, 4):
+                name = args[1]
+                port = int(args[3]) if len(args) == 4 else MODULE_PORT
+                modules[name] = {"host": args[2].strip("[]"), "port": port}
+                save_modules()
+                print("Module {} -> [{}]:{} (saved)".format(name, modules[name]["host"], port))
+                start_scheduler(name)
+            elif cmd == "delmodule" and len(args) == 2:
+                if modules.pop(args[1], None) is None:
+                    print("Unknown module", args[1])
+                else:
+                    save_modules()
+                    task = schedulers.pop(args[1], None)
+                    if task:
+                        task.cancel()
+                    print("Removed", args[1])
+            elif cmd == "connect" and len(args) == 2:
+                start_task(connect_command(args[1]))
+            elif cmd == "poll" and len(args) == 2:
+                if args[1] not in modules:
+                    print("Unknown module", args[1])
+                else:
+                    start_task(poll_command(args[1]))
+            elif cmd == "list":
                 if not clients:
-                    print("(no modules connected)")
+                    print("(no open links)")
                 for cid, (_, _, addr) in clients.items():
                     pc = pc_links.get(cid)
                     print("  {}  {}{}".format(label(cid), addr, "  <- PC {}".format(
                         pc.get_extra_info("peername")) if pc else ""))
-                print("PC target: {}".format(
-                    "module #{}".format(pipe_target) if pipe_target is not None else "last connected"))
-            elif cmd == "pipe" and len(parts) >= 2:
-                pipe_target = None if parts[1].lower() == "off" else int(parts[1])
-                print("Next PC goes to", "the last connected module" if pipe_target is None
-                      else "module #{}".format(pipe_target))
+                print("PC target: {}".format(pipe_target or "automatic"))
+            elif cmd == "pipe" and len(args) == 2:
+                pipe_target = None if args[1].lower() == "off" else args[1]
+                if pipe_target and pipe_target not in modules:
+                    print("Warning: {} is not a configured module".format(pipe_target))
+                print("Next PC goes to", pipe_target or "the automatic choice")
             elif cmd == "send" and len(parts) == 3:
                 payload = binascii.unhexlify(parts[2].replace(" ", ""))
                 await send_to(int(parts[1]), payload)
@@ -427,9 +587,7 @@ async def console():
                 else:
                     print("Unknown cached profile; run profiles", cid)
             elif cmd == "kick" and len(parts) >= 2:
-                entry = clients.get(int(parts[1]))
-                if entry:
-                    entry[1].close()
+                close_link(int(parts[1]))
             elif cmd == "quit":
                 for _, w, _ in list(clients.values()):
                     w.close()
@@ -442,11 +600,18 @@ async def console():
 
 
 async def main():
-    server = await asyncio.start_server(handle_client, HOST, PORT)
-    pc_server = await asyncio.start_server(handle_pc, HOST, PC_PORT)
-    log("Server listening on {}:{} (modules), {}:{} (PC relay)".format(HOST, PORT, HOST, PC_PORT))
-    async with server, pc_server:
-        await asyncio.gather(server.serve_forever(), pc_server.serve_forever(), console())
+    load_modules()
+    pc_server = await asyncio.start_server(
+        handle_pc, PC_HOST, PC_PORT, family=socket.AF_INET6
+    )
+    log("Modules: {}".format(", ".join(
+        "{} [{}]:{}".format(n, e["host"], e["port"]) for n, e in modules.items())
+        or "none"))
+    log("PC relay listening on [{}]:{}".format(PC_HOST, PC_PORT))
+    for index, name in enumerate(list(modules)):
+        start_scheduler(name, index * STARTUP_STAGGER)
+    async with pc_server:
+        await asyncio.gather(pc_server.serve_forever(), console())
 
 
 if __name__ == "__main__":

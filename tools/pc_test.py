@@ -1,31 +1,42 @@
 """
-pc_test.py - pretend to be a module with a meter attached, from a PC.
+pc_test.py - pretend to be an EC200U module with a meter attached, from a PC.
 
-    python pc_test.py [host] [port]        (default 127.0.0.1 5000)
+    python pc_test.py [port] [bind-address]      (default 5000 on ::)
 
-Connects to server.py like the Quectel module would and answers with
-dummy_meter.py. Then type  read 1  on the server console.
+Listens like device/main.py does (TCP server, IPv6) and answers every
+request with dummy_meter.py. Point server.py at it, for example:
+
+    setmodule TEST ::1 5000
+    poll TEST
 """
 import socket
 import sys
 
 from dummy_meter import DummyMeter
 
-host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
-port = int(sys.argv[2]) if len(sys.argv) > 2 else 5000
+port = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
+bind = sys.argv[2] if len(sys.argv) > 2 else "::"
 
-meter = DummyMeter()
-sock = socket.create_connection((host, port))
-print("Connected to {}:{} as a simulated module (Ctrl+C to stop)".format(host, port))
+server = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind((bind, port))
+server.listen(1)
+print("Simulated module listening on [{}]:{} (Ctrl+C to stop)".format(bind, port))
+
 try:
     while True:
-        data = sock.recv(2048)
-        if not data:
-            print("Server closed connection")
-            break
-        for reply in meter.feed(data):
-            sock.sendall(reply)
+        client, address = server.accept()
+        print("Server connected from", address[:2])
+        meter = DummyMeter()
+        with client:
+            while True:
+                data = client.recv(2048)
+                if not data:
+                    print("Server closed connection")
+                    break
+                for reply in meter.feed(data):
+                    client.sendall(reply)
 except KeyboardInterrupt:
     pass
 finally:
-    sock.close()
+    server.close()

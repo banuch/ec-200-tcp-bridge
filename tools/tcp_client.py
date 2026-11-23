@@ -9,7 +9,7 @@ import utime
 from machine import Pin
 
 
-SERVER_HOST = "65.20.77.137"
+SERVER_HOST = "2001:db8::1"  # replace with the server IPv6 or AAAA hostname
 SERVER_PORT = 5000
 DEVICE_ID = "EC200U_001"
 
@@ -49,14 +49,7 @@ def wait_for_network(timeout_seconds):
 
 
 def get_active_address_family():
-    """Prefer an active IPv4 bearer and fall back to IPv6."""
-    ipv4_result = dataCall.getInfo(1, 0)
-    if ipv4_result != -1 and len(ipv4_result) >= 3:
-        ipv4_info = ipv4_result[2]
-        if len(ipv4_info) >= 3 and ipv4_info[0] == 1:
-            print("Using IPv4:", ipv4_info[2])
-            return usocket.AF_INET
-
+    """Require and return an active IPv6 bearer."""
     ipv6_result = dataCall.getInfo(1, 1)
     if ipv6_result != -1 and len(ipv6_result) >= 3:
         ipv6_info = ipv6_result[2]
@@ -178,7 +171,7 @@ def run():
 
             address_family = get_active_address_family()
             if address_family is None:
-                print("No active IPv4 or IPv6 PDP address")
+                print("No active IPv6 PDP address")
                 utime.sleep(RECONNECT_DELAY_SECONDS)
                 continue
 

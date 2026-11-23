@@ -1,426 +1,423 @@
-# -*- coding: UTF-8 -*-
-"""EC200U QuecPython transparent DLMS/HDLC UART-to-TCP bridge."""
+# =========================================
+# WINTEK SOLUTIONS
+# EC200U-CN IPv6 SERIAL <-> TCP BRIDGE (TCP SERVER MODE)
+# =========================================
+#
+# Same network model AND socket usage as the working network-monitor
+# script: the EC200U listens on its own IPv6 address, TCP port 5000, the
+# Vultr server connects in, and every exchange is "client sends first,
+# module answers" on a plain blocking socket.
+#
+# DLMS/HDLC is request/response, so the bridge does exactly that:
+#   1. blocking recv() of a request from TCP
+#   2. write it to the meter UART
+#   3. collect the meter's reply until the line goes quiet
+#   4. send() the reply back on TCP
+# The module never sends unsolicited data, and the socket is never put
+# into non-blocking mode or registered with uselect: in testing, all of
+# those made the EC200U firmware reset the connection (RST) right after
+# it was opened.
+#
+# Nothing in this file restarts the module: no watchdog, no APN rewrite.
 
-import ubinascii
 import usocket
-import utime
-import checkNet
 import dataCall
-from machine import Pin, UART, WDT
+import ubinascii
+import utime
+from machine import Pin, UART
 
+# -----------------------------------------
+# Settings
+# -----------------------------------------
 
-# Vultr bridge_server/server/server.py endpoint.
-SERVER_HOST = "65.20.77.137"
-SERVER_PORT = 5000
+PORT = 5000
 DEVICE_ID = "EC200U_001"
 
-# Meter serial settings from the reference bridge project.
+NETWORK_POLL_S = 2      # how often to check for the data call at boot
+ACCEPT_TIMEOUT_S = 30   # how often accept() wakes to re-check the address
+RECV_TIMEOUT_S = 10     # recv() wakes this often to re-check the address
+IDLE_TIMEOUT_S = 120    # drop a client after this long with no request
+RETRY_DELAY_S = 5       # pause before rebinding after a server error
+
+# Meter serial port: UART2, 9600 8N1, no flow control
 UART_PORT = UART.UART2
 UART_BAUD = 9600
 UART_DATA_BITS = 8
-UART_PARITY = 0       # 0=None, 1=Even, 2=Odd
+UART_PARITY = 0         # 0=None, 1=Even, 2=Odd
 UART_STOP_BITS = 1
 UART_FLOW_CONTROL = 0
 
-# Keep the board's GPIO4/DTR output HIGH. The standalone probe confirmed that
-# the meter answers at both DTR levels, and HIGH is the required idle level.
-DTR_OUTPUT_LEVEL = 1
-
-FRAME_GAP_MS = 50
+METER_REPLY_TIMEOUT_MS = 3000   # wait this long for the first reply byte
+FRAME_GAP_MS = 50               # this much silence ends the reply
 MAX_CHUNK = 1024
-CONNECT_TIMEOUT_SECONDS = 15
-SOCKET_SETTLE_MS = 300
-SOCKET_WRITE_TIMEOUT_MS = 5000
-NETWORK_WAIT_SECONDS = 30
-RECONNECT_DELAY_SECONDS = 5
-READ_INTERVAL_SECONDS = 15 * 60
-WATCHDOG_FEED_INTERVAL_SECONDS = 10
-BOOT_DELAY_SECONDS = 3
 TRACE_HEX = True
 
-PROJECT_NAME = "EC200U_DLMS_BRIDGE"
-PROJECT_VERSION = "1.0.0"
+# GPIO4 = DTR, held HIGH for the meter interface
+DTR_LEVEL = 1
+
+# Connection LED on GPIO8: ON while a client is connected
+LED_ON = 1              # set to 0 if the LED is wired active-low
+
+connection_count = 0
 
 
-sock = None
-sock_ok = False
+# -----------------------------------------
+# GPIO
+# -----------------------------------------
+
+try:
+    dtr_pin = Pin(Pin.GPIO4, Pin.OUT, Pin.PULL_DISABLE, DTR_LEVEL)
+except Exception as e:
+    dtr_pin = None
+    print("GPIO4 DTR init failed:", e)
+
+try:
+    conn_led = Pin(Pin.GPIO8, Pin.OUT, Pin.PULL_DISABLE, 1 - LED_ON)
+except Exception as e:
+    conn_led = None
+    print("GPIO8 LED init failed:", e)
 
 
-class ServerCycleComplete(Exception):
-    """The server closed TCP cleanly after completing a meter read."""
+def set_conn_led(on):
+    if conn_led is None:
+        return
+    try:
+        conn_led.write(LED_ON if on else 1 - LED_ON)
+    except Exception as e:
+        print("GPIO8 LED write failed:", e)
 
 
-def trace_data(direction, data):
-    """Print relayed bytes without modifying them."""
-    timestamp_ms = utime.ticks_ms()
+def keep_dtr_high():
+    if dtr_pin is None:
+        return
+    try:
+        if dtr_pin.read() != DTR_LEVEL:
+            dtr_pin.write(DTR_LEVEL)
+            print("DTR GPIO4 restored HIGH")
+    except Exception as e:
+        print("GPIO4 DTR write failed:", e)
+
+
+def safe_call(fn):
+    try:
+        return fn()
+    except Exception as e:
+        print("Diagnostic error:", e)
+        return None
+
+
+# -----------------------------------------
+# Network
+# -----------------------------------------
+
+def get_ipv6():
+    # Returns the active IPv6 address, or None if the data call is down
+    info = safe_call(lambda: dataCall.getInfo(1, 1))
+
+    if isinstance(info, tuple) and len(info) >= 3:
+        ip = info[2]
+
+        if ip[0] == 1 and ip[2]:
+            return ip[2]
+
+    return None
+
+
+def wait_for_ipv6():
+    # At power-on main.py starts before the modem has registered,
+    # so keep polling instead of giving up.
+    waited = 0
+
+    while True:
+        ipv6 = get_ipv6()
+
+        if ipv6:
+            return ipv6
+
+        print("Waiting for IPv6 PDP...", waited, "s")
+        utime.sleep(NETWORK_POLL_S)
+        waited += NETWORK_POLL_S
+
+
+class ClientClosed(Exception):
+    pass
+
+
+# -----------------------------------------
+# Data transfer
+# -----------------------------------------
+
+def trace(direction, data):
     if TRACE_HEX:
         print("[%d ms] %s %d bytes: %s" % (
-            timestamp_ms,
-            direction,
-            len(data),
-            ubinascii.hexlify(data).upper(),
-        ))
+            utime.ticks_ms(), direction, len(data),
+            ubinascii.hexlify(data).upper()))
     else:
         print("[%d ms] %s %d bytes" % (
-            timestamp_ms,
-            direction,
-            len(data),
-        ))
+            utime.ticks_ms(), direction, len(data)))
 
 
-def configure_dtr_gpio():
-    """Configure GPIO4 as an output and keep it HIGH."""
-    pin = Pin(Pin.GPIO4, Pin.OUT, Pin.PULL_DISABLE, DTR_OUTPUT_LEVEL)
-    pin.write(DTR_OUTPUT_LEVEL)
-    print("DTR GPIO4 configured HIGH, level:", pin.read())
-    return pin
+def send_all(sock, payload):
+    total = 0
+
+    while total < len(payload):
+        n = sock.send(payload[total:])
+
+        if n is None or n <= 0:
+            raise Exception("Socket send failed")
+
+        total += n
+
+    return total
 
 
-def configure_meter_uart():
-    """Open the meter UART using the reference project's 9600 8N1 settings."""
-    port = UART(
+def recv_request(sock):
+    # Blocking recv with RECV_TIMEOUT_S. Returns bytes, or None on a
+    # timeout; raises ClientClosed when the client has gone.
+    started = utime.ticks_ms()
+
+    try:
+        data = sock.recv(MAX_CHUNK)
+
+    except Exception as e:
+        # Same test the working script uses for accept(): an exception
+        # after the full timeout is just "nothing arrived"; one that comes
+        # straight away is a real socket error.
+        elapsed = utime.ticks_diff(utime.ticks_ms(), started)
+
+        if elapsed >= (RECV_TIMEOUT_S - 1) * 1000:
+            return None
+
+        raise ClientClosed("recv error: %s" % e)
+
+    if not data:
+        raise ClientClosed("client closed the connection")
+
+    return data
+
+
+def uart_write_all(uart, data):
+    total = 0
+
+    while total < len(data):
+        n = uart.write(data[total:])
+
+        if n is None:
+            n = len(data) - total
+
+        if n <= 0:
+            raise Exception("UART write failed")
+
+        total += n
+
+    return total
+
+
+def read_meter_reply(uart):
+    # Wait up to METER_REPLY_TIMEOUT_MS for the first byte, then collect
+    # until FRAME_GAP_MS of silence or MAX_CHUNK bytes.
+    started = utime.ticks_ms()
+
+    while uart.any() == 0:
+        if utime.ticks_diff(utime.ticks_ms(), started) > METER_REPLY_TIMEOUT_MS:
+            return None
+        utime.sleep_ms(5)
+
+    reply = b""
+    last_rx = utime.ticks_ms()
+
+    while utime.ticks_diff(utime.ticks_ms(), last_rx) < FRAME_GAP_MS:
+        available = uart.any()
+
+        if available:
+            room = MAX_CHUNK - len(reply)
+            if room <= 0:
+                break
+
+            data = uart.read(min(available, room))
+
+            if data:
+                reply += data
+                last_rx = utime.ticks_ms()
+        else:
+            utime.sleep_ms(2)
+
+    return reply if reply else None
+
+
+def drain_uart(uart):
+    # Throw away stale or noise bytes before each request
+    discarded = 0
+
+    while uart.any():
+        data = uart.read(min(uart.any(), MAX_CHUNK))
+        if not data:
+            break
+        discarded += len(data)
+
+    return discarded
+
+
+# -----------------------------------------
+# Bridge session
+# -----------------------------------------
+
+def bridge(client, uart, ipv6):
+    # Request/response relay until the client leaves, goes idle,
+    # or the IPv6 address changes.
+    client.settimeout(RECV_TIMEOUT_S)
+    last_request = utime.ticks_ms()
+
+    while True:
+        keep_dtr_high()
+
+        request = recv_request(client)
+
+        if request is None:
+            # recv timed out: check the address and the idle limit
+            if get_ipv6() != ipv6:
+                raise Exception("IPv6 address changed or PDP lost")
+
+            idle = utime.ticks_diff(utime.ticks_ms(), last_request)
+
+            if idle > IDLE_TIMEOUT_S * 1000:
+                print("No request for", IDLE_TIMEOUT_S, "s; closing")
+                return
+
+            continue
+
+        last_request = utime.ticks_ms()
+        trace("TCP->METER", request)
+
+        discarded = drain_uart(uart)
+        if discarded:
+            print("Discarded", discarded, "stale UART bytes")
+
+        uart_write_all(uart, request)
+
+        reply = read_meter_reply(uart)
+
+        if reply:
+            trace("METER->TCP", reply)
+            send_all(client, reply)
+        else:
+            print("No meter reply within", METER_REPLY_TIMEOUT_MS, "ms")
+
+
+# -----------------------------------------
+# TCP server
+# -----------------------------------------
+
+def serve(ipv6, uart):
+    # Runs until the socket fails or the IPv6 address changes,
+    # then raises so main() can rebind.
+    global connection_count
+
+    server = usocket.socket(
+        usocket.AF_INET6,
+        usocket.SOCK_STREAM,
+        usocket.IPPROTO_TCP_SER
+    )
+
+    try:
+        server.bind((ipv6, PORT))
+        server.listen(1)
+        server.settimeout(ACCEPT_TIMEOUT_S)
+
+        print("IPv6:", ipv6)
+        print("Port:", PORT)
+        print("BRIDGE READY")
+
+        while True:
+            print("\nWaiting for Vultr client...")
+
+            started = utime.ticks_ms()
+
+            try:
+                client, address, remote_port = server.accept()
+
+            except Exception as e:
+                # accept() wakes up periodically so a changed or lost
+                # address is noticed even when no client connects.
+                if get_ipv6() != ipv6:
+                    raise Exception("IPv6 address changed or PDP lost")
+
+                elapsed = utime.ticks_diff(utime.ticks_ms(), started)
+
+                if elapsed < (ACCEPT_TIMEOUT_S - 1) * 1000:
+                    # Failed straight away: a real socket error
+                    raise e
+
+                continue
+
+            connection_count += 1
+            set_conn_led(True)
+
+            print("CONNECTED:", address, remote_port,
+                  "(connection", connection_count, ")")
+
+            try:
+                bridge(client, uart, ipv6)
+
+            except ClientClosed as e:
+                print("Session ended:", e)
+
+            except KeyboardInterrupt:
+                raise
+
+            except Exception as e:
+                print("BRIDGE ERROR:", e)
+                if get_ipv6() != ipv6:
+                    raise
+
+            finally:
+                try:
+                    client.close()
+                except:
+                    pass
+
+                set_conn_led(False)
+                print("CLIENT CLOSED")
+
+    finally:
+        set_conn_led(False)
+        try:
+            server.close()
+        except:
+            pass
+
+
+def main():
+    print("\n===================================")
+    print(" WINTEK IPv6 SERIAL-TCP BRIDGE")
+    print(" Device:", DEVICE_ID)
+    print("===================================")
+
+    uart = UART(
         UART_PORT,
         UART_BAUD,
         UART_DATA_BITS,
         UART_PARITY,
         UART_STOP_BITS,
-        UART_FLOW_CONTROL,
+        UART_FLOW_CONTROL
     )
-    print("Meter UART2 configured: 9600 8N1")
-    return port
-
-
-def create_watchdog():
-    """Enable a watchdog when supported by this firmware."""
-    try:
-        watchdog = WDT(60)
-        print("Watchdog enabled: 60 seconds")
-        return watchdog
-    except Exception as error:
-        print("Watchdog unavailable:", error)
-        return None
-
-
-def feed_watchdog(watchdog):
-    if watchdog is not None:
-        watchdog.feed()
-
-
-def wait_for_network(timeout_seconds):
-    """Support both old and new QuecPython checkNet APIs."""
-    if hasattr(checkNet, "waitNetworkReady"):
-        return checkNet.waitNetworkReady(timeout_seconds)
-
-    checker = checkNet.CheckNetwork(PROJECT_NAME, PROJECT_VERSION)
-    return checker.wait_network_connected(timeout_seconds)
-
-
-def wait_until_network_ready(watchdog):
-    """Wait until PDP context 1 is usable and has an IPv4 address."""
-    while True:
-        feed_watchdog(watchdog)
-        stage, state = wait_for_network(NETWORK_WAIT_SECONDS)
-        print("Network check: stage=%s, state=%s" % (stage, state))
-
-        if stage == 3 and state == 1:
-            ipv4 = dataCall.getInfo(1, 0)
-            ipv6 = dataCall.getInfo(1, 1)
-            print("PDP IPv4:", ipv4)
-            print("PDP IPv6:", ipv6)
-
-            if ipv4 != -1 and len(ipv4) >= 3:
-                ipv4_info = ipv4[2]
-                if len(ipv4_info) >= 3 and ipv4_info[0] == 1:
-                    return
-
-            print("Network is registered, but profile 1 has no active IPv4 address")
-
-        utime.sleep(RECONNECT_DELAY_SECONDS)
-
-
-def wait_for_next_cycle(watchdog):
-    """Wait for the next reading while feeding the 60-second watchdog."""
-    remaining = READ_INTERVAL_SECONDS
-    print("Read cycle complete; next connection in %d minutes" % (
-        READ_INTERVAL_SECONDS // 60,
-    ))
-
-    while remaining > 0:
-        feed_watchdog(watchdog)
-        delay = min(WATCHDOG_FEED_INTERVAL_SECONDS, remaining)
-        utime.sleep(delay)
-        remaining -= delay
-
-        if remaining > 0 and remaining % 60 == 0:
-            print("Next connection in %d minute(s)" % (remaining // 60))
-
-    print("Read interval finished; reconnecting")
-
-
-def send_all(active_socket, data):
-    """Write every byte to a non-blocking socket with a bounded wait."""
-    sent_total = 0
-    data_length = len(data)
-    started = utime.ticks_ms()
-
-    while sent_total < data_length:
-        try:
-            sent = active_socket.write(data[sent_total:])
-        except Exception as error:
-            if is_would_block_error(error):
-                if utime.ticks_diff(
-                    utime.ticks_ms(), started
-                ) >= SOCKET_WRITE_TIMEOUT_MS:
-                    raise OSError("Socket write timed out")
-                utime.sleep_ms(5)
-                continue
-            raise
-
-        if sent is None:
-            sent = data_length - sent_total
-        if sent <= 0:
-            raise OSError("Socket write returned %s" % sent)
-        sent_total += sent
-
-    return sent_total
-
-
-def write_uart_all(port, data):
-    """Write every byte to the meter UART or raise if it stalls."""
-    written_total = 0
-    data_length = len(data)
-
-    while written_total < data_length:
-        written = port.write(data[written_total:])
-        if written is None:
-            written = data_length - written_total
-        if written <= 0:
-            raise OSError("UART write returned %s" % written)
-        written_total += written
-
-    return written_total
-
-
-def close_socket():
-    """Mark the link down and release its socket."""
-    global sock, sock_ok
-
-    old_socket = sock
-    sock = None
-    sock_ok = False
-
-    if old_socket is not None:
-        try:
-            old_socket.close()
-        except Exception:
-            pass
-
-
-def socket_error_code(error):
-    """Extract an integer errno from a QuecPython socket exception."""
-    code = getattr(error, "errno", None)
-    if isinstance(code, int):
-        return code
-
-    arguments = getattr(error, "args", ())
-    if arguments and isinstance(arguments[0], int):
-        return arguments[0]
-    return None
-
-
-def is_would_block_error(error):
-    """Return True when a non-blocking socket simply has no data yet."""
-    code = socket_error_code(error)
-    if code == 11 or code == 41:
-        return True
-
-    message = str(error)
-    return "EAGAIN" in message or "EWOULDBLOCK" in message
-
-
-def is_clean_server_close_error(error):
-    """Detect how EC200U firmware reports a graceful remote TCP FIN."""
-    code = socket_error_code(error)
-    if code == 107:
-        return True
-
-    return "ENOTCONN" in str(error)
-
-
-def receive_tcp_nonblocking(active_socket):
-    """Read available TCP bytes without delaying UART processing."""
-    try:
-        data = active_socket.recv(MAX_CHUNK)
-    except Exception as error:
-        if is_would_block_error(error):
-            return None
-        if is_clean_server_close_error(error):
-            raise ServerCycleComplete()
-        raise
-
-    if data is None:
-        return None
-    if not data:
-        raise ServerCycleComplete()
-    return data
-
-
-def connect_server():
-    """Connect to Vultr and send the bridge identification line."""
-    global sock, sock_ok
-
-    address_info = usocket.getaddrinfo(
-        SERVER_HOST,
-        SERVER_PORT,
-        usocket.AF_INET,
-    )
-    if not address_info:
-        raise OSError("No IPv4 address returned for bridge server")
-
-    server_address = address_info[0][-1]
-    new_socket = usocket.socket(usocket.AF_INET, usocket.SOCK_STREAM)
-
-    try:
-        new_socket.settimeout(CONNECT_TIMEOUT_SECONDS)
-        print("Connecting to:", server_address)
-        new_socket.connect(server_address)
-        new_socket.settimeout(None)
-
-        hello = (
-            '{"type":"BRIDGE","deviceId":"%s"}\n' % DEVICE_ID
-        ).encode()
-        send_all(new_socket, hello)
-
-        # EC200U firmware can briefly report ENOTCONN when recv() is called
-        # immediately after connect and the first successful write. Allow the
-        # modem socket state to settle before enabling non-blocking polling.
-        utime.sleep_ms(SOCKET_SETTLE_MS)
-        new_socket.setblocking(False)
-
-        sock = new_socket
-        sock_ok = True
-
-        print("TCP CONNECTED; bridge hello sent; socket settled %d ms" % (
-            SOCKET_SETTLE_MS,
-        ))
-
-    except Exception:
-        new_socket.close()
-        raise
-
-
-def read_uart_frame(meter_uart):
-    """Collect UART bytes until a 50 ms silent gap or MAX_CHUNK is reached."""
-    if meter_uart.any() == 0:
-        return None
-
-    frame = b""
-    last_receive_ms = utime.ticks_ms()
-
-    while utime.ticks_diff(utime.ticks_ms(), last_receive_ms) < FRAME_GAP_MS:
-        available = meter_uart.any()
-        if available:
-            remaining = MAX_CHUNK - len(frame)
-            if remaining <= 0:
-                break
-
-            data = meter_uart.read(min(available, remaining))
-            if data:
-                frame += data
-                last_receive_ms = utime.ticks_ms()
-        else:
-            utime.sleep_ms(2)
-
-    return frame if frame else None
-
-
-def drain_uart(meter_uart):
-    """Discard stale serial bytes before starting a new TCP bridge session."""
-    discarded = 0
-    while meter_uart.any():
-        data = meter_uart.read(min(meter_uart.any(), MAX_CHUNK))
-        if not data:
-            break
-        discarded += len(data)
-    if discarded:
-        print("Discarded %d stale UART bytes" % discarded)
-
-
-def run():
-    """Run the boot-ready transparent bridge forever."""
-    global sock_ok
-
-    print("=== EC200U DLMS/HDLC UART-TCP bridge ===")
-    dtr_pin = configure_dtr_gpio()
-    meter_uart = configure_meter_uart()
-    watchdog = create_watchdog()
-
-    utime.sleep(BOOT_DELAY_SECONDS)
-    wait_until_network_ready(watchdog)
+    print("Meter UART2: 9600 8N1")
+    keep_dtr_high()
 
     while True:
-        feed_watchdog(watchdog)
-
-        if dtr_pin.read() != DTR_OUTPUT_LEVEL:
-            dtr_pin.write(DTR_OUTPUT_LEVEL)
-            print("DTR GPIO4 restored HIGH")
-
         try:
-            if sock is None or not sock_ok:
-                close_socket()
-                wait_until_network_ready(watchdog)
-                # Clear stale meter bytes before beginning a new read cycle.
-                drain_uart(meter_uart)
-                connect_server()
-
-            # The socket and UART are both serviced by this single loop.
-            # Non-blocking TCP receive ensures an immediate meter response is
-            # read without waiting for more server traffic.
-            active_socket = sock
-            server_data = receive_tcp_nonblocking(active_socket)
-            if server_data:
-                trace_data("SERVER->METER", server_data)
-                written = write_uart_all(meter_uart, server_data)
-                print("[%d ms] UART TX complete: %d/%d bytes" % (
-                    utime.ticks_ms(),
-                    written,
-                    len(server_data),
-                ))
-
-            frame = read_uart_frame(meter_uart)
-            if frame:
-                active_socket = sock
-                if active_socket is None or not sock_ok:
-                    raise OSError("TCP connection is unavailable")
-                trace_data("METER->SERVER", frame)
-                sent = send_all(active_socket, frame)
-                print("[%d ms] TCP TX complete: %d/%d bytes" % (
-                    utime.ticks_ms(),
-                    sent,
-                    len(frame),
-                ))
-
-            utime.sleep_ms(5)
+            ipv6 = wait_for_ipv6()
+            serve(ipv6, uart)
 
         except KeyboardInterrupt:
-            print("Bridge stopped by user")
-            close_socket()
+            print("Stopped")
             return
 
-        except ServerCycleComplete:
-            print("Server completed the meter cycle and closed TCP cleanly")
-            close_socket()
-            try:
-                wait_for_next_cycle(watchdog)
-            except KeyboardInterrupt:
-                print("Bridge stopped during interval wait")
-                return
+        except Exception as e:
+            print("SERVER ERROR:", e)
 
-        except Exception as error:
-            print("Bridge error:", error)
-            close_socket()
-            print("Reconnect in %d seconds..." % RECONNECT_DELAY_SECONDS)
-            utime.sleep(RECONNECT_DELAY_SECONDS)
+        print("Restarting server in", RETRY_DELAY_S, "s")
+        utime.sleep(RETRY_DELAY_S)
 
 
-run()
+main()

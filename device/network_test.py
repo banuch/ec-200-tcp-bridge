@@ -10,7 +10,7 @@ from tcp_client import build_wrapper_frame
 
 
 # Change these values when you are ready to test your own TCP server.
-SERVER_HOST = "65.20.77.137"
+SERVER_HOST = "2001:db8::1"  # replace with the server IPv6 or AAAA hostname
 SERVER_PORT = 5000
 NETWORK_WAIT_SECONDS = 60
 SOCKET_TIMEOUT_SECONDS = 15
@@ -29,7 +29,7 @@ def wait_for_network(timeout_seconds):
 
 
 def get_active_address_family():
-    """Print network details and return the active socket address family."""
+    """Print network details and require an active IPv6 bearer."""
     sim_status = sim.getStatus()
     print("SIM status:", sim_status)
     if sim_status != 1:
@@ -49,26 +49,13 @@ def get_active_address_family():
         print("Stage 1 = SIM, stage 2 = registration, stage 3 = PDP context.")
         return False
 
-    ipv4_result = dataCall.getInfo(1, 0)
     ipv6_result = dataCall.getInfo(1, 1)
-    print("PDP IPv4 information:", ipv4_result)
     print("PDP IPv6 information:", ipv6_result)
 
-    ipv4_info = None
     ipv6_info = None
-
-    if ipv4_result != -1 and len(ipv4_result) >= 3:
-        ipv4_info = ipv4_result[2]
 
     if ipv6_result != -1 and len(ipv6_result) >= 3:
         ipv6_info = ipv6_result[2]
-
-    if ipv4_info is not None and len(ipv4_info) >= 5 and ipv4_info[0] == 1:
-        print("Selected network: IPv4")
-        print("Module IPv4 address:", ipv4_info[2])
-        print("Primary DNS:", ipv4_info[3])
-        print("Secondary DNS:", ipv4_info[4])
-        return usocket.AF_INET
 
     if ipv6_info is not None and len(ipv6_info) >= 5 and ipv6_info[0] == 1:
         print("Selected network: IPv6")
@@ -77,7 +64,7 @@ def get_active_address_family():
         print("Secondary DNS:", ipv6_info[4])
         return usocket.AF_INET6
 
-    print("ERROR: PDP context 1 has no active IPv4 or IPv6 connection.")
+    print("ERROR: PDP context 1 has no active IPv6 connection.")
     return None
 
 

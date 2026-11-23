@@ -17,14 +17,14 @@ import checkNet
 from machine import UART, WDT
 
 # ---------------- settings ----------------
-SERVER_HOST = "65.20.77.137"   # change to your gateway IP / domain
+SERVER_HOST = "2001:db8::1"     # replace with server IPv6 / AAAA hostname
 SERVER_PORT = 5000                # change to your gateway port
 UART_PORT = UART.UART2
 UART_BAUD = 9600                  # match your meter (DLMS optical is often 300 7E1 -> 9600 8N1 after negotiation)
 FRAME_GAP_MS = 50                 # silence that marks the end of a frame
 MAX_CHUNK = 1024
 APN = "airtelgprs.com"
-PDP_IP_TYPE = 0                   # 0 = IPv4, 1 = IPv6, 2 = IPv4v6; server is IPv4-only
+PDP_IP_TYPE = 1                   # 0 = IPv4, 1 = IPv6, 2 = IPv4v6
 PROJECT_NAME = "UartTcpBridge"
 PROJECT_VERSION = "1.0.0"
 SIMULATE_METER = True           # True: answer the server from dummy_meter.py instead of the UART
@@ -48,7 +48,7 @@ def print_data_call():
     """Show APN / IP / DNS so a dead data path is visible in the log."""
     try:
         import dataCall
-        print("PDP info:", dataCall.getInfo(1, 0))   # (profile, ipType, [state, reconnect, ip, dns1, dns2])
+        print("PDP IPv6 info:", dataCall.getInfo(1, 1))
     except Exception as e:
         print("PDP info error:", e)
     try:
@@ -89,18 +89,11 @@ def wait_network():
         print("Waiting for network...", stage, state)
 
 
-def is_ip(host):
-    parts = host.split(".")
-    return len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
-
-
 def resolve(host, port):
-    if is_ip(host):                   # no DNS needed for a literal IP
-        return (host, port)
-    info = usocket.getaddrinfo(host, port)
+    info = usocket.getaddrinfo(host, port, usocket.AF_INET6)
     if not info:
-        raise OSError("DNS lookup failed for " + host)
-    return info[0][-1]
+        raise OSError("No IPv6 address found for " + host)
+    return info[0][0], info[0][-1]
 
 
 def tcp_connect():
@@ -108,9 +101,9 @@ def tcp_connect():
     step = "resolve"
     s = None
     try:
-        addr = resolve(SERVER_HOST, SERVER_PORT)
+        family, addr = resolve(SERVER_HOST, SERVER_PORT)
         step = "socket"
-        s = usocket.socket(usocket.AF_INET, usocket.SOCK_STREAM)
+        s = usocket.socket(family, usocket.SOCK_STREAM)
         step = "connect " + str(addr)
         s.settimeout(15)          # connect timeout only
         s.connect(addr)

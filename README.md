@@ -9,7 +9,8 @@ server through a Quectel EC200U running QuecPython.
 - `device/network_test.py` - SIM, PDP, DNS and TCP diagnostics.
 - `device/dlms_uart_probe.py` - standalone DLMS SNRM/UA UART test.
 - `device/serial_*` and `device/uart_port_scan_test.py` - UART/DB9 tests.
-- `server/server.py` - asyncio TCP server and automatic reading scheduler.
+- `server/server.py` - asyncio client that connects to the modules and
+  schedules automatic reads.
 - `server/dlms_reader.py` - Gurux DLMS session and OBIS reads.
 - `server/profile_store.py` - SQLite storage for discovered Profile Generic
   metadata, rows and incremental synchronization state.
@@ -21,17 +22,29 @@ server through a Quectel EC200U running QuecPython.
 - Meter serial port: `UART.UART2`, 9600 baud, 8N1.
 - DB9 RS-232: pin 2 RX, pin 3 TX and pin 5 GND.
 - GPIO4/DTR is configured as an output and held HIGH.
-- Cellular PDP context must provide IPv4 connectivity.
+- Cellular PDP context must provide IPv6 connectivity.
+
+## How the link works
+
+The EC200U is the TCP **server** and the Vultr VM is the TCP **client**:
+
+- `device/main.py` listens on the module's own IPv6 address, TCP port 5000,
+  and prints that address at boot (`IPv6: ...`).
+- `server/server.py` connects out to every module listed in
+  `server/modules.json`.
+- Each exchange is request/response: the server sends a DLMS frame, the module
+  writes it to the meter UART, collects the reply until the line is quiet for
+  50 ms, and sends it back. The module never sends data on its own and never
+  restarts itself.
 
 ## Automatic read cycle
 
-1. EC200U connects to the server and sends its bridge identity.
-2. The server automatically performs the configured DLMS meter reads.
-3. The server completes DLMS release and HDLC disconnect.
-4. The server closes TCP gracefully.
-5. EC200U waits 15 minutes while feeding its watchdog, then reconnects.
-6. Network failures retry after five seconds; failed meter reads retry on the
-   server after 60 seconds.
+1. The server connects to the module.
+2. The server performs the configured DLMS meter reads.
+3. The server completes DLMS release and HDLC disconnect, then closes TCP.
+4. 15 minutes later it connects again.
+5. If the module cannot be reached the server retries after 60 seconds; a
+   failed meter read also retries after 60 seconds.
 
 ## Server setup
 
@@ -43,16 +56,35 @@ python -m pip install -r requirements.txt
 python server.py
 ```
 
-The default ports are TCP 5000 for field modules and TCP 4059 for the
-optional PC relay. Update the VM firewall when these defaults are changed.
+On first start the server creates `server/modules.json`:
+
+```json
+{"EC200U_001": {"host": "2401:4900:9864:a48c::2", "port": 5000}}
+```
+
+When a module gets a new IPv6 address, update it from the server console
+(saved to `modules.json`, no restart needed):
+
+```text
+setmodule EC200U_001 <new-ipv6>
+modules
+poll EC200U_001
+```
+
+The server needs no inbound port for modules. Allow inbound TCP 4059 only
+when the optional PC relay is used.
 
 ## Device deployment
 
-Set `SERVER_HOST`, `SERVER_PORT` and `DEVICE_ID` near the top of
-`device/main.py`, then upload it to the EC200U as `/usr/main.py` and reboot.
+Set `PORT` and `DEVICE_ID` near the top of `device/main.py`, upload it to the
+EC200U as `/usr/main.py` and reboot. Note the `IPv6:` address it prints and
+enter it on the server with `setmodule`.
 
-The server automatically starts reading after a valid bridge hello; the
-manual `read <id>` command remains available for diagnostics.
+Test without a meter from the VM: `nc -6 <module-ipv6> 5000`, type a line,
+and the module log shows `TCP->METER` followed by `No meter reply`.
+
+Test the server without hardware: `python tools/pc_test.py 5055 ::1` on the
+same PC, then `setmodule TEST ::1 5055` and `poll TEST` on the server console.
 
 ## Association View and profile data
 
