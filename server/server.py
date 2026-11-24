@@ -515,7 +515,7 @@ async def console():
           "readprofile <id> <obis> entry <start> <count> | "
           "readprofile <id> <obis> range <from> <to> | "
           "enableprofile|disableprofile <id> <obis> | "
-          "pipe <name>|off | kick <id> | quit")
+          "pipe <name>|off | kick <id> | autoread on|off | quit")
     while True:
         line = await loop.run_in_executor(None, sys.stdin.readline)
         if not line:
@@ -599,6 +599,18 @@ async def console():
                         "Enabled" if enabled else "Disabled", args[2], label(cid)))
                 else:
                     print("Unknown cached profile; run profiles", cid)
+            elif cmd == "autoread" and len(args) == 2 and args[1].lower() in ("on", "off"):
+                # off: stop scheduled reads so manual send/read tests are not
+                # interrupted; on: restart them for every configured module.
+                if args[1].lower() == "off":
+                    for task in list(schedulers.values()):
+                        task.cancel()
+                    schedulers.clear()
+                    print("Scheduled reads OFF")
+                else:
+                    for name in modules:
+                        start_scheduler(name)
+                    print("Scheduled reads ON")
             elif cmd == "kick" and len(parts) >= 2:
                 close_link(int(parts[1]))
             elif cmd == "quit":
