@@ -3,6 +3,9 @@
 This project connects a DLMS/COSEM electricity meter to a remote Python
 server through a Quectel EC200U running QuecPython.
 
+**Day-to-day operation (deploy, run, Gurux Director via the VM,
+troubleshooting): see [docs/RUNBOOK.md](docs/RUNBOOK.md).**
+
 ## Project layout
 
 - `device/main.py` - production QuecPython UART-to-TCP bridge.
