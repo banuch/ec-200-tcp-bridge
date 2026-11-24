@@ -32,8 +32,8 @@ PHYSICAL_SERVER = 1
 AUTHENTICATION = Authentication.LOW
 PASSWORD = "lnt1"
 WAIT_TIME = 5                 # seconds to wait for each reply
-REQUEST_GAP = 0.5             # pause before each request (testing whether the
-                              # EC200U link reset is timing related; 0 = off)
+REQUEST_GAP = 0               # pause before each request, seconds (timing was
+                              # ruled out as the cause of the EC200U link reset)
 RESEND_COUNT = 3              # resends of a frame before giving up
 TRACE = True                  # log every TX/RX frame in hex
 
@@ -254,9 +254,9 @@ def choose_time_window(profile, state, max_rows):
 
 
 class MeterSession:
-    def __init__(self, cid, writer, log):
+    def __init__(self, cid, send, log):
         self.cid = cid
-        self.writer = writer
+        self.send = send                # async send(bytes) to the module link
         self.log = log
         self.rx = asyncio.Queue()
         self.resends = RESEND_COUNT
@@ -279,8 +279,10 @@ class MeterSession:
             await asyncio.sleep(REQUEST_GAP)
             if TRACE:
                 self.log("DLMS TX #{}: {}".format(self.cid, _hex(frame)))
-            self.writer.write(bytes(frame))
-            await self.writer.drain()
+            try:
+                await self.send(bytes(frame))
+            except OSError:
+                raise LinkClosed()
             buf = GXByteBuffer()
             notify = GXReplyData()
             try:

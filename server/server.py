@@ -70,6 +70,14 @@ READ_INTERVAL = 15 * 60     # seconds between scheduled reads of a module
 CONNECT_RETRY = 60          # retry after the module could not be reached
 AUTO_READ_RETRY = 60        # retry after an unsuccessful meter read
 AUTO_READ_DELAY = 2         # seconds after connecting before DLMS
+# The EC200U firmware resets a TCP connection on the first request after the
+# module has sent 3 replies on it (server/link_test.py). The meter's DLMS
+# session does not depend on the TCP connection (DTR stays LOW), so the
+# server quietly opens a new connection before that limit. Counts requests,
+# which is never fewer than the module's replies. 0 = no limit.
+MAX_REQUESTS_PER_LINK = 3
+RELINK_ATTEMPTS = 5         # connect tries when reopening a link
+RELINK_RETRY_DELAY = 1.0    # seconds between those tries
 STARTUP_STAGGER = 5         # seconds between first reads of several modules
 RELAY_TRACE = True          # log relayed bytes in hex
 LOG_FILE = "bridge_log.txt"
@@ -85,7 +93,9 @@ pc_links = {}               # link id -> writer of the PC piped to it
 pipe_target = None          # module name for the next PC, None = automatic
 schedulers = {}             # module name -> scheduler task
 link_locks = {}             # module name -> asyncio.Lock (one connect at a time)
-closing = set()             # link ids this server is closing itself
+closing = set()             # module writers this server closed itself
+relinking = set()           # module writers being replaced by a new connection
+link_requests = {}          # link id -> requests sent on its current connection
 tasks = set()               # running background tasks (keeps references alive)
 next_id = 1
 profile_store = ProfileStore(PROFILE_DB_FILE)
@@ -200,8 +210,75 @@ async def open_link(name):
 def close_link(cid):
     entry = clients.get(cid)
     if entry:
-        closing.add(cid)
+        closing.add(entry[1])
         entry[1].close()
+
+
+def drop_link(cid, reason):
+    """Forget a link for good: abort its read, drop its PC, log why."""
+    session = sessions.get(cid)
+    if session:
+        session.feed(None)              # abort a running read
+    pc = pc_links.pop(cid, None)
+    if pc:
+        pc.close()                      # the PC sees the meter link drop
+    entry = clients.pop(cid, None)
+    if entry:
+        entry[1].close()
+    link_requests.pop(cid, None)
+    log("Link {} closed: {}".format(label(cid), reason))
+    names.pop(cid, None)
+
+
+async def relink(cid):
+    """Replace link cid's TCP connection with a new one (same link id)."""
+    name = names.get(cid)
+    entry = modules.get(name)
+    old = clients.get(cid)
+    if old is None or entry is None:
+        raise ConnectionResetError("link {} is gone".format(cid))
+
+    sent = link_requests.get(cid, 0)
+    relinking.add(old[1])
+    old[1].close()
+    try:
+        await old[1].wait_closed()
+    except OSError:
+        pass
+
+    error = None
+    for attempt in range(RELINK_ATTEMPTS):
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(entry["host"], entry["port"],
+                                        family=socket.AF_INET6),
+                CONNECT_TIMEOUT)
+            break
+        except (OSError, asyncio.TimeoutError) as e:
+            error = e
+            await asyncio.sleep(RELINK_RETRY_DELAY)
+    else:
+        drop_link(cid, "reconnect failed after {} tries: {!r}".format(
+            RELINK_ATTEMPTS, error))
+        raise ConnectionResetError("reconnect to {} failed".format(name))
+
+    addr = writer.get_extra_info("peername")
+    clients[cid] = (reader, writer, addr)
+    link_requests[cid] = 0
+    log("Link {} reconnected after {} requests (EC200U limit)".format(label(cid), sent))
+    start_task(module_reader(cid, reader, writer, addr))
+
+
+async def link_write(cid, data):
+    """Send one request to a module, reconnecting first at the request limit."""
+    if cid not in clients:
+        raise ConnectionResetError("link {} is closed".format(cid))
+    if MAX_REQUESTS_PER_LINK and link_requests.get(cid, 0) >= MAX_REQUESTS_PER_LINK:
+        await relink(cid)
+    writer = clients[cid][1]
+    writer.write(data)
+    await writer.drain()
+    link_requests[cid] = link_requests.get(cid, 0) + 1
 
 
 async def module_reader(cid, reader, writer, addr):
@@ -211,7 +288,7 @@ async def module_reader(cid, reader, writer, addr):
         while True:
             data = await asyncio.wait_for(reader.read(2048), IDLE_TIMEOUT)
             if not data:
-                if cid in closing:
+                if writer in closing or writer in relinking:
                     reason = "closed by this server"
                 else:
                     reason = "module closed it (EOF/FIN)"
@@ -238,17 +315,12 @@ async def module_reader(cid, reader, writer, addr):
         reason = "closed by this server"
         raise
     finally:
-        session = sessions.get(cid)
-        if session:
-            session.feed(None)          # abort a running read
-        pc = pc_links.pop(cid, None)
-        if pc:
-            pc.close()                  # the PC sees the meter link drop
-        clients.pop(cid, None)
         writer.close()
-        log("Link {} closed: {}".format(label(cid), reason))
-        names.pop(cid, None)
-        closing.discard(cid)
+        closing.discard(writer)
+        if writer in relinking:
+            relinking.discard(writer)   # replaced by relink(); link stays open
+        elif clients.get(cid, (None, None))[1] is writer:
+            drop_link(cid, reason)
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +422,6 @@ async def handle_pc(reader, writer):
         return
 
     pc_links[cid] = writer
-    module_writer = clients[cid][1]
     log("PC {} piped to module {}".format(addr, label(cid)))
     try:
         while True:
@@ -359,8 +430,7 @@ async def handle_pc(reader, writer):
                 break
             if RELAY_TRACE:
                 log("PC->METER {} ({} bytes): {}".format(label(cid), len(data), _hex(data)))
-            module_writer.write(data)
-            await module_writer.drain()
+            await link_write(cid, data)
     except asyncio.TimeoutError:
         log("PC {} idle for {}s, dropping".format(addr, IDLE_TIMEOUT))
     except (ConnectionResetError, BrokenPipeError):
@@ -383,11 +453,10 @@ async def send_to(cid, payload):
     if not entry:
         print("No such link:", cid)
         return
-    _, writer, addr = entry
-    writer.write(payload)
-    await writer.drain()
+    await link_write(cid, payload)
     log("TX #{} {} ({} bytes): {}".format(
-        cid, addr, len(payload), binascii.hexlify(payload, " ").decode().upper()))
+        cid, clients[cid][2] if cid in clients else entry[2], len(payload),
+        binascii.hexlify(payload, " ").decode().upper()))
 
 
 async def read_meter(cid):
@@ -401,7 +470,7 @@ async def read_meter(cid):
     if cid in pc_links:
         print("A PC is piped to link", cid)
         return False
-    session = dlms_reader.MeterSession(cid, entry[1], log)
+    session = dlms_reader.MeterSession(cid, lambda data: link_write(cid, data), log)
     sessions[cid] = session
     log("DLMS {}: reading meter...".format(label(cid)))
     success = False
@@ -440,7 +509,7 @@ async def scan_meter_profiles(cid):
     if cid in sessions or cid in pc_links:
         print("Link {} is busy".format(cid))
         return
-    session = dlms_reader.MeterSession(cid, entry[1], log)
+    session = dlms_reader.MeterSession(cid, lambda data: link_write(cid, data), log)
     sessions[cid] = session
     try:
         profiles, _ = await dlms_reader.scan_profiles(
@@ -465,7 +534,7 @@ async def read_meter_profile(cid, obis, mode, values):
     if cid in sessions or cid in pc_links:
         print("Link {} is busy".format(cid))
         return
-    session = dlms_reader.MeterSession(cid, entry[1], log)
+    session = dlms_reader.MeterSession(cid, lambda data: link_write(cid, data), log)
     sessions[cid] = session
     try:
         result = await dlms_reader.read_profile_manual(

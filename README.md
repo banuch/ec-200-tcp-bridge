@@ -36,8 +36,13 @@ The EC200U is the TCP **server** and the Vultr VM is the TCP **client**:
   `server/modules.json`.
 - Each exchange is request/response: the server sends a DLMS frame, the module
   writes it to the meter UART, collects the reply until the line is quiet for
-  50 ms, and sends it back. The module never sends data on its own and never
+  200 ms, and sends it back. The module never sends data on its own and never
   restarts itself.
+- The EC200U firmware resets a TCP connection on the first request after the
+  module has sent 3 replies on it. The server therefore opens a new
+  connection every `MAX_REQUESTS_PER_LINK` (3) requests, without telling the
+  DLMS session; the meter keeps its association because DTR stays LOW.
+  `server/link_test.py` reproduces the limit.
 
 ## Automatic read cycle
 
