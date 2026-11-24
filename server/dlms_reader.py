@@ -15,12 +15,13 @@ import binascii
 import json
 from datetime import datetime, timedelta, timezone
 
-from gurux_dlms import GXByteBuffer, GXDLMSClient, GXDLMSException, GXReplyData
-from gurux_dlms.enums import Authentication, InterfaceType, Standard, Unit
+from gurux_dlms import GXByteBuffer, GXDateTime, GXDLMSClient, GXDLMSException, GXReplyData
+from gurux_dlms.enums import Authentication, DateTimeSkips, InterfaceType, Standard, Unit
 from gurux_dlms.objects import (
     GXDLMSClock,
     GXDLMSData,
     GXDLMSDemandRegister,
+    GXDLMSExtendedRegister,
     GXDLMSProfileGeneric,
     GXDLMSRegister,
 )
@@ -59,25 +60,43 @@ PROFILE_CHECK_SECONDS = {
 }
 
 # (group, label, COSEM class, OBIS). Registers get scaler/unit applied.
+# Matches the object list of the L&T single-phase meter (IS 15959, category
+# C3) as shown by Gurux Director; objects it lacks print as "n/a (...)".
 READ_LIST = [
     ("Identity", "Serial number", GXDLMSData, "0.0.96.1.0.255"),
     ("Identity", "Manufacturer", GXDLMSData, "0.0.96.1.1.255"),
+    ("Identity", "Logical device name", GXDLMSData, "0.0.42.0.0.255"),
     ("Identity", "Meter type", GXDLMSData, "0.0.94.91.9.255"),
+    ("Identity", "Meter category", GXDLMSData, "0.0.94.91.11.255"),
+    ("Identity", "Current rating", GXDLMSData, "0.0.94.91.12.255"),
+    ("Identity", "Year of manufacture", GXDLMSData, "0.0.96.1.4.255"),
     ("Identity", "Firmware version", GXDLMSData, "1.0.0.2.0.255"),
     ("Clock", "Date/time", GXDLMSClock, "0.0.1.0.0.255"),
-    ("Instantaneous", "Voltage (1-ph)", GXDLMSRegister, "1.0.12.7.0.255"),
-    ("Instantaneous", "Voltage L1", GXDLMSRegister, "1.0.32.7.0.255"),
-    ("Instantaneous", "Voltage L2", GXDLMSRegister, "1.0.52.7.0.255"),
-    ("Instantaneous", "Voltage L3", GXDLMSRegister, "1.0.72.7.0.255"),
-    ("Instantaneous", "Current (1-ph)", GXDLMSRegister, "1.0.11.7.0.255"),
-    ("Instantaneous", "Current L1", GXDLMSRegister, "1.0.31.7.0.255"),
-    ("Instantaneous", "Current L2", GXDLMSRegister, "1.0.51.7.0.255"),
-    ("Instantaneous", "Current L3", GXDLMSRegister, "1.0.71.7.0.255"),
+    ("Instantaneous", "Voltage", GXDLMSRegister, "1.0.12.7.0.255"),
+    ("Instantaneous", "Phase current", GXDLMSRegister, "1.0.11.7.0.255"),
+    ("Instantaneous", "Neutral current", GXDLMSRegister, "1.0.91.7.0.255"),
     ("Instantaneous", "Power factor", GXDLMSRegister, "1.0.13.7.0.255"),
     ("Instantaneous", "Frequency", GXDLMSRegister, "1.0.14.7.0.255"),
     ("Instantaneous", "Active power", GXDLMSRegister, "1.0.1.7.0.255"),
+    ("Instantaneous", "Apparent power", GXDLMSRegister, "1.0.9.7.0.255"),
     ("Energy", "Import active energy", GXDLMSRegister, "1.0.1.8.0.255"),
     ("Energy", "Import apparent energy", GXDLMSRegister, "1.0.9.8.0.255"),
+    ("Maximum demand", "MD active (import)", GXDLMSExtendedRegister, "1.0.1.6.0.255"),
+    ("Maximum demand", "MD apparent (import)", GXDLMSExtendedRegister, "1.0.9.6.0.255"),
+    ("Durations", "Power failure duration", GXDLMSRegister, "0.0.94.91.8.255"),
+    ("Durations", "Power on duration", GXDLMSRegister, "0.0.94.91.14.255"),
+    ("Billing", "Billing count", GXDLMSData, "0.0.0.1.0.255"),
+    ("Billing", "Available billing periods", GXDLMSData, "0.0.0.1.1.255"),
+    ("Billing", "Billing date", GXDLMSRegister, "0.0.0.1.2.255"),
+    ("Counters", "Cumulative tamper count", GXDLMSData, "0.0.94.91.0.255"),
+    ("Counters", "Programming count", GXDLMSData, "0.0.96.2.0.255"),
+    ("Counters", "Events: current related", GXDLMSData, "0.0.96.11.1.255"),
+    ("Counters", "Events: power related", GXDLMSData, "0.0.96.11.2.255"),
+    ("Counters", "Events: transaction", GXDLMSData, "0.0.96.11.3.255"),
+    ("Counters", "Events: others", GXDLMSData, "0.0.96.11.4.255"),
+    ("Counters", "Events: non-roll over", GXDLMSData, "0.0.96.11.5.255"),
+    ("Settings", "Demand integration period", GXDLMSData, "1.0.0.8.0.255"),
+    ("Settings", "Profile capture period", GXDLMSData, "1.0.0.8.4.255"),
 ]
 
 UNIT_TEXT = {
@@ -96,6 +115,8 @@ def _hex(data):
 
 
 def _format(value):
+    if isinstance(value, GXDateTime):
+        return _format_datetime(value)
     if isinstance(value, (bytes, bytearray)):
         if value and all(32 <= b < 127 for b in value):
             return value.decode("ascii")
@@ -103,6 +124,18 @@ def _format(value):
     if isinstance(value, float):
         return "{:g}".format(round(value, 3))
     return str(value)
+
+
+def _format_datetime(value):
+    """Full date and time, marking fields the meter left unspecified."""
+    moment = value.value
+    if moment is None:
+        return "not set"
+    skip = value.skip or DateTimeSkips.NONE
+    date = "????-??-??" if skip & (DateTimeSkips.YEAR | DateTimeSkips.MONTH | DateTimeSkips.DAY)         else moment.strftime("%Y-%m-%d")
+    # Meter local time as sent; Gurux fills in the PC's zone when the meter
+    # gives no deviation, so no offset is printed.
+    return "{} {}".format(date, moment.strftime("%H:%M:%S"))
 
 
 def _enum_text(value):
