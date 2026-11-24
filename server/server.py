@@ -69,7 +69,7 @@ IDLE_TIMEOUT = 600          # seconds without data before dropping a link / PC
 READ_INTERVAL = 15 * 60     # seconds between scheduled reads of a module
 CONNECT_RETRY = 60          # retry after the module could not be reached
 AUTO_READ_RETRY = 60        # retry after an unsuccessful meter read
-AUTO_READ_DELAY = 2         # seconds after connecting before DLMS (module waits 1 s for DTR)
+AUTO_READ_DELAY = 2         # seconds after connecting before DLMS
 STARTUP_STAGGER = 5         # seconds between first reads of several modules
 RELAY_TRACE = True          # log relayed bytes in hex
 LOG_FILE = "bridge_log.txt"
@@ -85,13 +85,16 @@ pc_links = {}               # link id -> writer of the PC piped to it
 pipe_target = None          # module name for the next PC, None = automatic
 schedulers = {}             # module name -> scheduler task
 link_locks = {}             # module name -> asyncio.Lock (one connect at a time)
+closing = set()             # link ids this server is closing itself
 tasks = set()               # running background tasks (keeps references alive)
 next_id = 1
 profile_store = ProfileStore(PROFILE_DB_FILE)
 
 
 def log(line):
-    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    now = time.time()
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)) + ".%03d" % (
+        int(now * 1000) % 1000)
     text = "[{}] {}".format(stamp, line)
     print(text)
     with open(LOG_FILE, "a", encoding="utf-8") as f:
@@ -197,15 +200,21 @@ async def open_link(name):
 def close_link(cid):
     entry = clients.get(cid)
     if entry:
+        closing.add(cid)
         entry[1].close()
 
 
 async def module_reader(cid, reader, writer, addr):
     """Route everything the module sends until the link closes."""
+    reason = "unknown"
     try:
         while True:
             data = await asyncio.wait_for(reader.read(2048), IDLE_TIMEOUT)
             if not data:
+                if cid in closing:
+                    reason = "closed by this server"
+                else:
+                    reason = "module closed it (EOF/FIN)"
                 break
             pc = pc_links.get(cid)
             session = sessions.get(cid)
@@ -222,9 +231,12 @@ async def module_reader(cid, reader, writer, addr):
             else:
                 handle_data(cid, addr, data)
     except asyncio.TimeoutError:
-        log("Link {} idle for {}s, closing".format(label(cid), IDLE_TIMEOUT))
-    except (ConnectionResetError, BrokenPipeError, OSError):
-        pass
+        reason = "idle for {}s".format(IDLE_TIMEOUT)
+    except (ConnectionResetError, BrokenPipeError, OSError) as error:
+        reason = "socket error {!r}".format(error)
+    except asyncio.CancelledError:
+        reason = "closed by this server"
+        raise
     finally:
         session = sessions.get(cid)
         if session:
@@ -234,8 +246,9 @@ async def module_reader(cid, reader, writer, addr):
             pc.close()                  # the PC sees the meter link drop
         clients.pop(cid, None)
         writer.close()
-        log("Link {} closed".format(label(cid)))
+        log("Link {} closed: {}".format(label(cid), reason))
         names.pop(cid, None)
+        closing.discard(cid)
 
 
 # ---------------------------------------------------------------------------

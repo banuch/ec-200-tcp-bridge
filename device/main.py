@@ -54,10 +54,10 @@ FRAME_GAP_MS = 200              # this much silence ends the reply
 MAX_CHUNK = 1024
 TRACE_HEX = True
 
-# GPIO4 = DTR to the meter. Asserted only while the Vultr server is
-# connected (like a modem during a call), released between reads.
-DTR_ACTIVE = 1          # GPIO level that asserts DTR; 0 if the line is inverted
-DTR_SETTLE_MS = 1000    # meter port wake time after DTR goes active (as the probe)
+# GPIO4 = DTR to the meter, held LOW (asserted) for the whole program.
+# The meter answers SNRM only with GPIO4 LOW (dlms_uart_probe.py).
+DTR_LEVEL = 0
+DTR_SETTLE_MS = 1000    # meter port wake time after boot (as the probe)
 
 # Connection LED on GPIO8: ON while a client is connected
 LED_ON = 1              # set to 0 if the LED is wired active-low
@@ -70,7 +70,7 @@ connection_count = 0
 # -----------------------------------------
 
 try:
-    dtr_pin = Pin(Pin.GPIO4, Pin.OUT, Pin.PULL_DISABLE, 1 - DTR_ACTIVE)
+    dtr_pin = Pin(Pin.GPIO4, Pin.OUT, Pin.PULL_DISABLE, DTR_LEVEL)
 except Exception as e:
     dtr_pin = None
     print("GPIO4 DTR init failed:", e)
@@ -91,19 +91,14 @@ def set_conn_led(on):
         print("GPIO8 LED write failed:", e)
 
 
-def set_dtr(active, quiet=False):
-    # Drive GPIO4; logs only when the level actually changes
+def hold_dtr():
+    # Keep GPIO4 at DTR_LEVEL; logs only if it had drifted
     if dtr_pin is None:
         return
-    level = DTR_ACTIVE if active else 1 - DTR_ACTIVE
     try:
-        if dtr_pin.read() != level:
-            dtr_pin.write(level)
-            if not quiet:
-                print("DTR GPIO4", "ON" if active else "OFF",
-                      "(level %d)" % level)
-            elif active:
-                print("DTR GPIO4 restored ON")
+        if dtr_pin.read() != DTR_LEVEL:
+            dtr_pin.write(DTR_LEVEL)
+            print("DTR GPIO4 restored LOW")
     except Exception as e:
         print("GPIO4 DTR write failed:", e)
 
@@ -310,7 +305,7 @@ def bridge(client, uart, ipv6):
     last_request = utime.ticks_ms()
 
     while True:
-        set_dtr(True, quiet=True)   # keep DTR asserted for the whole session
+        hold_dtr()   # GPIO4 stays LOW
 
         request = recv_request(client)
 
@@ -398,15 +393,10 @@ def serve(ipv6, uart):
                   "(connection", connection_count, ")")
 
             try:
-                # Assert DTR for this session and let the meter port wake.
-                # Requests that arrive meanwhile wait in the TCP buffer.
-                set_dtr(True)
-                utime.sleep_ms(DTR_SETTLE_MS)
-
                 bridge(client, uart, ipv6)
 
             except ClientClosed as e:
-                print("Session ended:", e)
+                print("[%d ms] Session ended: %s" % (utime.ticks_ms(), e))
 
             except KeyboardInterrupt:
                 raise
@@ -422,12 +412,10 @@ def serve(ipv6, uart):
                 except:
                     pass
 
-                set_dtr(False)
                 set_conn_led(False)
                 print("CLIENT CLOSED")
 
     finally:
-        set_dtr(False)
         set_conn_led(False)
         try:
             server.close()
@@ -450,8 +438,10 @@ def main():
         UART_FLOW_CONTROL
     )
     print("Meter UART2: 9600 8N1")
-    set_dtr(False)
-    print("DTR GPIO4 OFF until a client connects")
+    hold_dtr()
+    print("DTR GPIO4 held LOW, level:",
+          dtr_pin.read() if dtr_pin else "n/a")
+    utime.sleep_ms(DTR_SETTLE_MS)
 
     while True:
         try:

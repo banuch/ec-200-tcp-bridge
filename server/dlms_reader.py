@@ -32,6 +32,8 @@ PHYSICAL_SERVER = 1
 AUTHENTICATION = Authentication.LOW
 PASSWORD = "lnt1"
 WAIT_TIME = 5                 # seconds to wait for each reply
+REQUEST_GAP = 0.5             # pause before each request (testing whether the
+                              # EC200U link reset is timing related; 0 = off)
 RESEND_COUNT = 3              # resends of a frame before giving up
 TRACE = True                  # log every TX/RX frame in hex
 
@@ -274,6 +276,7 @@ class MeterSession:
             while not self.rx.empty():          # drop stale bytes
                 if self.rx.get_nowait() is None:
                     raise LinkClosed()
+            await asyncio.sleep(REQUEST_GAP)
             if TRACE:
                 self.log("DLMS TX #{}: {}".format(self.cid, _hex(frame)))
             self.writer.write(bytes(frame))
