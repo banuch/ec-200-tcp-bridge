@@ -5,7 +5,7 @@ has been run on the real setup (L&T single-phase meter, EC200U, Airtel
 NB-IoT SIM, Vultr VM) as of 2026-11-24.
 
 ```
-GXDLMSDirector (PC) ──SSH tunnel──► Vultr VM ──IPv6, TCP 5000──► EC200U ──UART2 / RS-232──► Meter
+GXDLMSDirector (PC) ──SSH tunnel──► Vultr VM ──IPv6, TCP 4059──► EC200U ──UART2 / RS-232──► Meter
                                     server.py                    device/main.py
 ```
 
@@ -39,7 +39,7 @@ GXDLMSDirector (PC) ──SSH tunnel──► Vultr VM ──IPv6, TCP 5000─�
    Meter UART2: 9600 8N1
    DTR GPIO4 held LOW, level: 0
    IPv6: 2401:4900:....::2
-   Port: 5000
+   Port: 4059
    BRIDGE READY
    Waiting for Vultr client...
    ```
@@ -91,7 +91,7 @@ modules
 At start and then every 15 minutes the server reads each module:
 
 ```
-Connecting to module EC200U_001 at [...]:5000
+Connecting to module EC200U_001 at [...]:4059
 Module #1 (EC200U_001) connected ...
 DLMS #1 (EC200U_001): reading meter...
 DLMS #1: associated (client 32, server 0/1)

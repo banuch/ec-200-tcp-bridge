@@ -24,7 +24,7 @@ and server.py would also connect to it):
 
     python3 link_test.py                 # all tests
     python3 link_test.py count replay    # just these
-    python3 link_test.py --host 2401:4900:9864:a48c::2 --port 5000
+    python3 link_test.py --host 2401:4900:9864:a48c::2 --port 4059
 
 The module address is read from modules.json (first module) unless --host
 is given.
@@ -39,7 +39,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODULES_FILE = os.environ.get("BRIDGE_MODULES", os.path.join(HERE, "modules.json"))
 DEFAULT_HOST = "2401:4900:9864:a48c::2"
-DEFAULT_PORT = 5000
+DEFAULT_PORT = 4059
 
 REPLY_TIMEOUT = 6.0     # module waits 4 s for the meter, plus network time
 REQUEST_GAP = 0.5       # pause after a reply before the next request

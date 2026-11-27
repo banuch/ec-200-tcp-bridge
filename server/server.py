@@ -5,10 +5,10 @@ Run on your PC / VM:   python server.py
 Needs Python 3.8+ and gurux-dlms (pip install -r requirements.txt).
 
 What it does
- - Each EC200U listens on its own IPv6 address, TCP port 5000
+ - Each EC200U listens on its own IPv6 address, TCP port 4059
    (device/main.py). This server CONNECTS OUT to every configured module.
  - Modules are listed in modules.json next to this file:
-       {"EC200U_001": {"host": "2401:4900:9864:a48c::2", "port": 5000}}
+       {"EC200U_001": {"host": "2401:4900:9864:a48c::2", "port": 4059}}
    The module prints its IPv6 address at boot ("IPv6: ..."). When the
    operator gives it a new address, update it with the "setmodule" command
    (saved to modules.json) - no restart needed.
@@ -53,7 +53,7 @@ from profile_store import ProfileStore
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-MODULE_PORT = 5000          # default port the EC200U listens on (device PORT)
+MODULE_PORT = 4059          # default port the EC200U listens on (device PORT)
 MODULES_FILE = os.environ.get("BRIDGE_MODULES", os.path.join(HERE, "modules.json"))
 DEFAULT_MODULES = {
     # Used only when modules.json does not exist yet.

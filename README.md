@@ -33,7 +33,7 @@ troubleshooting): see [docs/RUNBOOK.md](docs/RUNBOOK.md).**
 
 The EC200U is the TCP **server** and the Vultr VM is the TCP **client**:
 
-- `device/main.py` listens on the module's own IPv6 address, TCP port 5000,
+- `device/main.py` listens on the module's own IPv6 address, TCP port 4059,
   and prints that address at boot (`IPv6: ...`).
 - `server/server.py` connects out to every module listed in
   `server/modules.json`.
@@ -69,7 +69,7 @@ python server.py
 On first start the server creates `server/modules.json`:
 
 ```json
-{"EC200U_001": {"host": "2401:4900:9864:a48c::2", "port": 5000}}
+{"EC200U_001": {"host": "2401:4900:9864:a48c::2", "port": 4059}}
 ```
 
 When a module gets a new IPv6 address, update it from the server console
@@ -90,7 +90,7 @@ Set `PORT` and `DEVICE_ID` near the top of `device/main.py`, upload it to the
 EC200U as `/usr/main.py` and reboot. Note the `IPv6:` address it prints and
 enter it on the server with `setmodule`.
 
-Test without a meter from the VM: `nc -6 <module-ipv6> 5000`, type a line,
+Test without a meter from the VM: `nc -6 <module-ipv6> 4059`, type a line,
 and the module log shows `TCP->METER` (with no `METER->TCP` after it).
 
 Test the server without hardware: `python tools/pc_test.py 5055 ::1` on the

@@ -4,7 +4,7 @@
 # =========================================
 #
 # Same network model AND socket usage as the working network-monitor
-# script: the EC200U listens on its own IPv6 address, TCP port 5000, the
+# script: the EC200U listens on its own IPv6 address, TCP port 4059, the
 # Vultr server connects in, and every exchange is "client sends first,
 # module answers" on a plain blocking socket.
 #
@@ -32,7 +32,7 @@ from machine import Pin, UART
 # Settings
 # -----------------------------------------
 
-PORT = 5000
+PORT = 4059            # DLMS/COSEM registered port
 DEVICE_ID = "EC200U_001"
 
 NETWORK_POLL_S = 2      # how often to check for the data call at boot
