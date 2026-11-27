@@ -23,9 +23,16 @@ What it does
    module. The target is the module chosen with "pipe <name>", else the
    module connected last, else the only configured module. The server opens
    the connection to the module if it is not open yet.
+ - Heartbeat on UDP HEARTBEAT_PORT (4060): every module sends one small
+   signed JSON packet every HEARTBEAT_INTERVAL seconds. The server marks a
+   module online/offline (offline after HEARTBEAT_MISSED missed beats) and,
+   when a correctly signed beat comes from a new IPv6 address, updates
+   modules.json itself. The shared key is read from heartbeat_key.txt next
+   to this file or the BRIDGE_HB_KEY environment variable (never in git).
  - Console commands:
 
        modules                       configured modules and their state
+       heartbeat                     last heartbeat from every device
        setmodule <name> <ipv6> [port]  add a module or change its address
        delmodule <name>              remove a module
        connect <name>                open a link (for send / read testing)
@@ -42,6 +49,9 @@ Meter addresses / password live in dlms_reader.py.
 """
 import asyncio
 import binascii
+import hashlib
+import hmac
+import ipaddress
 import json
 import os
 import socket
@@ -84,6 +94,12 @@ RELINK_RETRY_DELAY = 1.0    # seconds between those tries
 STARTUP_STAGGER = 5         # seconds between first reads of several modules
 RELAY_TRACE = True          # log relayed bytes in hex
 LOG_FILE = "bridge_log.txt"
+HEARTBEAT_HOST = "::"       # heartbeat UDP listener (all IPv6 interfaces)
+HEARTBEAT_PORT = 4060       # device HEARTBEAT_PORT
+HEARTBEAT_INTERVAL = 300    # seconds between beats (device HEARTBEAT_INTERVAL_S)
+HEARTBEAT_MISSED = 3        # missed beats before a module is shown offline
+HEARTBEAT_KEY_FILE = os.environ.get(
+    "BRIDGE_HB_KEY_FILE", os.path.join(HERE, "heartbeat_key.txt"))
 PROFILE_COLLECTION_ENABLED = True
 PROFILE_DB_FILE = os.environ.get(
     "BRIDGE_PROFILE_DB", os.path.join(HERE, "bridge_data.sqlite3"))
@@ -100,6 +116,7 @@ closing = set()             # module writers this server closed itself
 relinking = set()           # module writers being replaced by a new connection
 link_requests = {}          # link id -> requests sent on its current connection
 link_replies = {}           # link id -> data chunks received on its current connection
+heartbeats = {}             # device id -> last beat (fields + at/src/signed/online)
 tasks = set()               # running background tasks (keeps references alive)
 next_id = 1
 profile_store = ProfileStore(PROFILE_DB_FILE)
@@ -168,6 +185,133 @@ def live_cid(name):
         if n == name and cid in clients:
             return cid
     return None
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat (UDP from the modules)
+# ---------------------------------------------------------------------------
+
+def load_heartbeat_key():
+    key = os.environ.get("BRIDGE_HB_KEY", "").strip()
+    if not key and os.path.exists(HEARTBEAT_KEY_FILE):
+        with open(HEARTBEAT_KEY_FILE, encoding="utf-8") as f:
+            key = f.read().strip()
+    return key.encode() or None
+
+
+heartbeat_key = load_heartbeat_key()
+
+
+def same_ip(a, b):
+    try:
+        return (ipaddress.ip_address(str(a).split("%")[0])
+                == ipaddress.ip_address(str(b).split("%")[0]))
+    except ValueError:
+        return False
+
+
+def handle_heartbeat(data, src):
+    """One UDP datagram: JSON, optionally followed by "|<hex HMAC-SHA256>"."""
+    if len(data) > 1024:
+        return
+    payload, sig = data, None
+    if b"|" in data:
+        payload, sig = data.rsplit(b"|", 1)
+    try:
+        beat = json.loads(payload.decode("utf-8"))
+        name = beat["id"]
+        if not isinstance(name, str):
+            raise ValueError("id is not a string")
+        seq, up = int(beat.get("seq", 0)), int(beat.get("up", 0))
+    except (ValueError, KeyError, TypeError, AttributeError,
+            UnicodeDecodeError) as error:
+        log("Heartbeat from [{}] ignored: bad packet ({})".format(src, error))
+        return
+
+    signed = False
+    if sig is not None and heartbeat_key:
+        good = hmac.new(heartbeat_key, payload, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(good.encode(), sig.strip().lower()):
+            log("Heartbeat '{}' from [{}] ignored: wrong signature".format(name, src))
+            return
+        signed = True
+
+    prev = heartbeats.get(name)
+    rebooted = prev is not None and up < prev.get("up", 0)
+    newer = prev is None or rebooted or seq > prev.get("seq", 0)
+    if not newer:
+        return                          # duplicate or replayed beat
+
+    beat.update(at=time.time(), src=src, signed=signed, online=True)
+    heartbeats[name] = beat
+
+    if prev is None or not prev.get("online"):
+        log("Heartbeat: {} ONLINE from [{}]".format(name, src))
+    elif rebooted:
+        log("Heartbeat: {} rebooted (up {}s)".format(name, up))
+    log("HEARTBEAT {} #{} up={}s csq={} client={} meter_age={} {}".format(
+        name, seq, up, beat.get("csq"), beat.get("client"),
+        beat.get("meter_age"), "signed" if signed else "UNSIGNED"))
+
+    ip = beat.get("ip")
+    entry = modules.get(name)
+    if entry is None:
+        log("Heartbeat: {} is not a configured module (setmodule {} {})".format(
+            name, name, ip))
+        return
+    if not ip or same_ip(entry["host"], ip):
+        return
+    if not signed:
+        log("Heartbeat: {} reports IPv6 {} (configured {}); unsigned, so not "
+            "changed: run setmodule {} {}".format(name, ip, entry["host"], name, ip))
+    elif not same_ip(src, ip):
+        log("Heartbeat: {} reports IPv6 {} but came from [{}]; not changed".format(
+            name, ip, src))
+    else:
+        old = entry["host"]
+        entry["host"] = str(ip).strip("[]")
+        save_modules()
+        log("Module {} IPv6 changed {} -> {} (from heartbeat, saved)".format(
+            name, old, entry["host"]))
+
+
+class HeartbeatProtocol(asyncio.DatagramProtocol):
+    def datagram_received(self, data, addr):
+        try:
+            handle_heartbeat(data, addr[0])
+        except Exception as error:      # never let one packet stop the listener
+            log("Heartbeat from {} failed: {!r}".format(addr, error))
+
+
+async def heartbeat_monitor():
+    """Mark modules offline after HEARTBEAT_MISSED missed beats."""
+    limit = HEARTBEAT_INTERVAL * HEARTBEAT_MISSED
+    while True:
+        await asyncio.sleep(30)
+        now = time.time()
+        for name, beat in heartbeats.items():
+            if beat.get("online") and now - beat["at"] > limit:
+                beat["online"] = False
+                log("Heartbeat: {} OFFLINE (no beat for {}s)".format(
+                    name, int(now - beat["at"])))
+
+
+def heartbeat_state(name):
+    beat = heartbeats.get(name)
+    if beat is None:
+        return "no heartbeat"
+    return "{} (beat {}s ago)".format(
+        "live" if beat.get("online") else "OFFLINE", int(time.time() - beat["at"]))
+
+
+def print_heartbeats():
+    if not heartbeats:
+        print("(no heartbeat received yet)")
+    for name, beat in heartbeats.items():
+        print("  {:<14} {}  #{} up={}s ip={} csq={} client={} meter_age={} {}".format(
+            name, heartbeat_state(name), beat.get("seq"), beat.get("up"),
+            beat.get("ip"), beat.get("csq"), beat.get("client"),
+            beat.get("meter_age"), "signed" if beat.get("signed") else "UNSIGNED"))
 
 
 # ---------------------------------------------------------------------------
@@ -583,13 +727,14 @@ def print_modules():
     for name, entry in modules.items():
         cid = live_cid(name)
         state = "link {}".format(cid) if cid is not None else "not connected"
-        print("  {:<14} [{}]:{}  {}".format(name, entry["host"], entry["port"], state))
+        print("  {:<14} [{}]:{}  {}  heartbeat: {}".format(
+            name, entry["host"], entry["port"], state, heartbeat_state(name)))
 
 
 async def console():
     global pipe_target
     loop = asyncio.get_running_loop()
-    print("Commands: modules | setmodule <name> <ipv6> [port] | delmodule <name> | "
+    print("Commands: modules | heartbeat | setmodule <name> <ipv6> [port] | delmodule <name> | "
           "connect <name> | poll <name> | list | send <id> <hex> | "
           "sendtext <id> <text> | read <id> | objects <id> | profiles <id> | "
           "profile-status <id> | readprofile <id> <obis> last <count> | "
@@ -610,6 +755,8 @@ async def console():
         try:
             if cmd == "modules":
                 print_modules()
+            elif cmd == "heartbeat":
+                print_heartbeats()
             elif cmd == "setmodule" and len(args) in (3, 4):
                 name = args[1]
                 port = int(args[3]) if len(args) == 4 else MODULE_PORT
@@ -714,6 +861,14 @@ async def main():
         "{} [{}]:{}".format(n, e["host"], e["port"]) for n, e in modules.items())
         or "none"))
     log("PC relay listening on [{}]:{}".format(PC_HOST, PC_PORT))
+    await asyncio.get_running_loop().create_datagram_endpoint(
+        HeartbeatProtocol, local_addr=(HEARTBEAT_HOST, HEARTBEAT_PORT),
+        family=socket.AF_INET6)
+    log("Heartbeat listening on UDP [{}]:{} ({})".format(
+        HEARTBEAT_HOST, HEARTBEAT_PORT,
+        "key loaded" if heartbeat_key else "NO KEY: beats accepted unsigned, "
+        "addresses never auto-updated"))
+    start_task(heartbeat_monitor())
     for index, name in enumerate(list(modules)):
         start_scheduler(name, index * STARTUP_STAGGER)
     async with pc_server:

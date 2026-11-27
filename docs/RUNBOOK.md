@@ -6,7 +6,7 @@ NB-IoT SIM, Vultr VM) as of 2026-11-24.
 
 ```
 GXDLMSDirector (PC) ──SSH tunnel──► Vultr VM ──IPv6, TCP 4059──► EC200U ──UART2 / RS-232──► Meter
-                                    server.py                    device/main.py
+                                    server.py ◄──UDP 4060 heartbeat── device/main.py
 ```
 
 - The SIM is whitelisted to the Vultr VM only. Nothing else can reach the
@@ -48,7 +48,12 @@ GXDLMSDirector (PC) ──SSH tunnel──► Vultr VM ──IPv6, TCP 4059─�
    - Note the `IPv6:` address. If it changed, update the VM (section 3.3).
 
 Settings at the top of `device/main.py`: `PORT`, `DEVICE_ID`,
-`UART_GAP_MS` (200), `RECV_POLL_MS` (50), `IDLE_TIMEOUT_S` (120).
+`UART_GAP_MS` (200), `RECV_POLL_MS` (50), `IDLE_TIMEOUT_S` (120),
+`HEARTBEAT_HOST` (VM IPv6), `HEARTBEAT_PORT` (4060), `HEARTBEAT_INTERVAL_S` (300).
+
+Also upload the heartbeat key to the module as `/usr/heartbeat_key.txt`
+(section 3.5). Without it the boot log shows
+`No /usr/heartbeat_key.txt - heartbeats will be unsigned`.
 
 ---
 
@@ -106,13 +111,60 @@ A read is about 48 requests, so expect ~16 `reconnected` lines and
 20–40 seconds per read. Results and profile rows are in `bridge_log.txt`
 and `bridge_data.sqlite3` next to `server.py`.
 
+### 3.5 Heartbeat (UDP 4060)
+
+Every 300 s the module sends one UDP packet to the VM on port 4060, on its
+own socket (never the bridge connection). It is a JSON line signed with
+HMAC-SHA256:
+
+```text
+{"id": "EC200U_001", "seq": 12, "up": 3605, "ip": "2401:...::2", "csq": 21, "client": 0, "meter_age": 840}|<hex signature>
+```
+
+| Field | Meaning |
+|---|---|
+| `id` | `DEVICE_ID` |
+| `seq` | beat number since boot |
+| `up` | seconds since boot (a drop means the module rebooted) |
+| `ip` | the module's current IPv6 address |
+| `csq` | signal quality 0–31, 99 = unknown |
+| `client` | 1 while the VM is connected to the bridge |
+| `meter_age` | seconds since the meter last sent a byte, -1 = not since boot |
+
+One-time setup (the key is never committed: `heartbeat_key.txt` is in
+`.gitignore`):
+
+```bash
+cd ~/ec-200-tcp-bridge/server
+python3 -c "import secrets; print(secrets.token_hex(16))" > heartbeat_key.txt
+cat heartbeat_key.txt          # copy this line to the module
+sudo ufw allow 4060/udp        # if ufw is enabled
+```
+
+Put the same line in a file `heartbeat_key.txt` and upload it to the
+module as `/usr/heartbeat_key.txt` (QPYcom file browser), then reboot the
+module. The key can also be given to the server as `BRIDGE_HB_KEY`.
+
+What the server does:
+
+- Logs `Heartbeat: EC200U_001 ONLINE` on the first beat and
+  `OFFLINE (no beat for ...s)` after 3 missed beats (15 min).
+- **Updates the module's IPv6 address in `modules.json` by itself** when a
+  correctly signed, newer beat reports a new `ip` **and** comes from that
+  same address: `Module EC200U_001 IPv6 changed ... (from heartbeat, saved)`.
+  `setmodule` (3.3) is then only needed for a new module.
+- Unsigned beats (no key on the module or the server) are shown, but the
+  address is never changed from them. Beats with a wrong signature, and
+  repeated or old `seq` values, are dropped.
+
 ---
 
 ## 4. Server console commands
 
 | Command | Use |
 |---|---|
-| `modules` | configured modules and whether a link is open |
+| `modules` | configured modules, whether a link is open, and heartbeat state (live / OFFLINE) |
+| `heartbeat` | last heartbeat from every device (seq, uptime, IPv6, signal, meter age) |
 | `list` | open links and their ids (`#1`, `#2`, ...) |
 | `poll EC200U_001` | run one full read now |
 | `connect EC200U_001` | open a link without reading (prints the link id) |
@@ -194,6 +246,8 @@ and the meter itself private.
 
 | Symptom | Check / action |
 |---|---|
+| `modules` shows `no heartbeat` | Module log shows `HEARTBEAT #n sent`? `HEARTBEAT_HOST` is the VM's IPv6? UDP 4060 open on the VM firewall (and in the Vultr firewall group)? |
+| `Heartbeat ... ignored: wrong signature` | `/usr/heartbeat_key.txt` on the module and `server/heartbeat_key.txt` differ |
 | `Module EC200U_001 not reachable` | Module booted and shows `BRIDGE READY`? IPv6 changed (compare boot log with `modules`)? Data call up? |
 | Module log shows `TCP->METER` with no `METER->TCP` after it | Boot log shows `level: 0`? DB9 cable and GND (pin 5)? Loopback jumper removed? Run `device/dlms_uart_probe.py` (section 8). |
 | `Link #N closed: socket error ConnectionResetError` in the middle of a read | Was `server.py` updated (`git pull`)? `MAX_REQUESTS_PER_LINK` must be 3. Run `server/link_test.py` to re-check the limit. |

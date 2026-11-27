@@ -37,6 +37,11 @@ The EC200U is the TCP **server** and the Vultr VM is the TCP **client**:
   and prints that address at boot (`IPv6: ...`).
 - `server/server.py` connects out to every module listed in
   `server/modules.json`.
+- Every 300 s the module also sends a signed UDP heartbeat to the VM on
+  port 4060 (id, uptime, IPv6, signal, whether the meter has talked
+  recently). The server shows modules as live/offline and updates a
+  module's IPv6 address from a correctly signed beat. Setup: docs/RUNBOOK.md
+  section 3.5.
 - The module is a transparent bridge: every byte from TCP goes to the meter
   UART and every byte from the UART goes back on TCP, with no filtering.
   UART bytes are sent once the line has been quiet for 200 ms, so a meter
