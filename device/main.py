@@ -200,7 +200,6 @@ def hmac_sha256(key, msg):
 
 hb_key = load_heartbeat_key()
 hb_sock = None
-hb_addr = None
 hb_seq = 0
 hb_last = None              # ticks_ms of the last beat attempt
 
@@ -241,23 +240,30 @@ def heartbeat_packet(ipv6):
 
 def send_heartbeat(ipv6):
     # Never raises: a lost beat must not disturb the bridge
-    global hb_sock, hb_addr, hb_seq, hb_last
+    # Same socket pattern as the working IPv6 tests: a plain (ip, port)
+    # tuple (no getaddrinfo) and a two-argument socket(). The UDP socket is
+    # connected once, then each beat is a send().
+    global hb_sock, hb_seq, hb_last
     hb_last = utime.ticks_ms()
     hb_seq += 1
+    step = "packet"
 
     try:
-        if hb_sock is None:
-            hb_addr = usocket.getaddrinfo(HEARTBEAT_HOST, HEARTBEAT_PORT)[0][-1]
-            hb_sock = usocket.socket(
-                usocket.AF_INET6, usocket.SOCK_DGRAM, usocket.IPPROTO_UDP)
-
         packet = heartbeat_packet(ipv6)
-        hb_sock.sendto(packet, hb_addr)
+
+        if hb_sock is None:
+            step = "socket"
+            hb_sock = usocket.socket(usocket.AF_INET6, usocket.SOCK_DGRAM)
+            step = "connect"
+            hb_sock.connect((HEARTBEAT_HOST, HEARTBEAT_PORT))
+
+        step = "send"
+        hb_sock.send(packet)
         print("[%d ms] HEARTBEAT #%d sent (%d bytes)" % (
             utime.ticks_ms(), hb_seq, len(packet)))
 
     except Exception as e:
-        print("Heartbeat failed:", e)
+        print("Heartbeat failed at %s: %s %s" % (step, type(e).__name__, e))
         try:
             hb_sock.close()
         except Exception:
