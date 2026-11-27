@@ -73,8 +73,11 @@ AUTO_READ_DELAY = 2         # seconds after connecting before DLMS
 # The EC200U firmware resets a TCP connection on the first request after the
 # module has sent 3 replies on it (server/link_test.py). The meter's DLMS
 # session does not depend on the TCP connection (DTR stays LOW), so the
-# server quietly opens a new connection before that limit. Counts requests,
-# which is never fewer than the module's replies. 0 = no limit.
+# server quietly opens a new connection before that limit. The module is a
+# transparent bridge, so one request can produce more than one module send
+# (a noise burst, a split frame, unsolicited meter data). The server
+# therefore reconnects when EITHER the requests sent OR the data chunks
+# received on the connection reach the limit. 0 = no limit.
 MAX_REQUESTS_PER_LINK = 3
 RELINK_ATTEMPTS = 5         # connect tries when reopening a link
 RELINK_RETRY_DELAY = 1.0    # seconds between those tries
@@ -96,6 +99,7 @@ link_locks = {}             # module name -> asyncio.Lock (one connect at a time
 closing = set()             # module writers this server closed itself
 relinking = set()           # module writers being replaced by a new connection
 link_requests = {}          # link id -> requests sent on its current connection
+link_replies = {}           # link id -> data chunks received on its current connection
 tasks = set()               # running background tasks (keeps references alive)
 next_id = 1
 profile_store = ProfileStore(PROFILE_DB_FILE)
@@ -226,6 +230,7 @@ def drop_link(cid, reason):
     if entry:
         entry[1].close()
     link_requests.pop(cid, None)
+    link_replies.pop(cid, None)
     log("Link {} closed: {}".format(label(cid), reason))
     names.pop(cid, None)
 
@@ -239,6 +244,7 @@ async def relink(cid):
         raise ConnectionResetError("link {} is gone".format(cid))
 
     sent = link_requests.get(cid, 0)
+    received = link_replies.get(cid, 0)
     relinking.add(old[1])
     old[1].close()
     try:
@@ -265,7 +271,9 @@ async def relink(cid):
     addr = writer.get_extra_info("peername")
     clients[cid] = (reader, writer, addr)
     link_requests[cid] = 0
-    log("Link {} reconnected after {} requests (EC200U limit)".format(label(cid), sent))
+    link_replies[cid] = 0
+    log("Link {} reconnected after {} requests / {} replies (EC200U limit)".format(
+        label(cid), sent, received))
     start_task(module_reader(cid, reader, writer, addr))
 
 
@@ -273,7 +281,9 @@ async def link_write(cid, data):
     """Send one request to a module, reconnecting first at the request limit."""
     if cid not in clients:
         raise ConnectionResetError("link {} is closed".format(cid))
-    if MAX_REQUESTS_PER_LINK and link_requests.get(cid, 0) >= MAX_REQUESTS_PER_LINK:
+    if MAX_REQUESTS_PER_LINK and (
+            link_requests.get(cid, 0) >= MAX_REQUESTS_PER_LINK
+            or link_replies.get(cid, 0) >= MAX_REQUESTS_PER_LINK):
         await relink(cid)
     writer = clients[cid][1]
     writer.write(data)
@@ -293,6 +303,8 @@ async def module_reader(cid, reader, writer, addr):
                 else:
                     reason = "module closed it (EOF/FIN)"
                 break
+            if clients.get(cid, (None, None))[1] is writer:
+                link_replies[cid] = link_replies.get(cid, 0) + 1
             pc = pc_links.get(cid)
             session = sessions.get(cid)
             if pc:

@@ -8,15 +8,17 @@
 # Vultr server connects in, and every exchange is "client sends first,
 # module answers" on a plain blocking socket.
 #
-# DLMS/HDLC is request/response, so the bridge does exactly that:
-#   1. blocking recv() of a request from TCP
-#   2. write it to the meter UART
-#   3. collect the meter's reply until the line goes quiet
-#   4. send() the reply back on TCP
-# The module never sends unsolicited data, and the socket is never put
-# into non-blocking mode or registered with uselect: in testing, all of
-# those made the EC200U firmware reset the connection (RST) right after
-# it was opened.
+# The bridge is fully transparent: every byte from TCP is written to the
+# meter UART, and every byte from the UART is sent to TCP, with no HDLC
+# filtering and no request/response pairing. Unsolicited meter data and
+# noise bytes are forwarded too.
+#
+# The socket stays in blocking mode with a short timeout (RECV_POLL_MS)
+# and the UART is checked between recv() calls. It is never put into
+# non-blocking mode or registered with uselect: in testing, both made the
+# EC200U firmware reset the connection (RST) right after it was opened.
+# Note: the module sending data before the server has sent anything was
+# also seen to cause a reset, so unsolicited meter bytes may do the same.
 #
 # Nothing in this file restarts the module: no watchdog, no APN rewrite.
 
@@ -35,8 +37,9 @@ DEVICE_ID = "EC200U_001"
 
 NETWORK_POLL_S = 2      # how often to check for the data call at boot
 ACCEPT_TIMEOUT_S = 30   # how often accept() wakes to re-check the address
-RECV_TIMEOUT_S = 10     # recv() wakes this often to re-check the address
-IDLE_TIMEOUT_S = 120    # drop a client after this long with no request
+RECV_POLL_MS = 50       # recv() timeout; the UART is checked between recvs
+CHECK_INTERVAL_S = 10   # how often to re-check the address and idle limit
+IDLE_TIMEOUT_S = 120    # drop a client after this long with no data either way
 RETRY_DELAY_S = 5       # pause before rebinding after a server error
 
 # Meter serial port: UART2, 9600 8N1, no flow control
@@ -47,10 +50,10 @@ UART_PARITY = 0         # 0=None, 1=Even, 2=Odd
 UART_STOP_BITS = 1
 UART_FLOW_CONTROL = 0
 
-# Reply timing from the working dlms_uart_probe.py. Keep the timeout under
-# the server's 5 s DLMS WAIT_TIME so a missing reply is retried cleanly.
-METER_REPLY_TIMEOUT_MS = 4000   # wait this long for the meter's HDLC frame
-FRAME_GAP_MS = 200              # this much silence ends the reply
+# UART bytes are sent to TCP once the line has been quiet this long, so a
+# meter frame normally goes out in one send (the EC200U counts sends
+# towards its 3-reply link limit). 200 ms is the gap the probe used.
+UART_GAP_MS = 200
 MAX_CHUNK = 1024
 TRACE_HEX = True
 
@@ -177,20 +180,19 @@ def send_all(sock, payload):
 
 
 def recv_request(sock):
-    # Blocking recv with RECV_TIMEOUT_S. Returns bytes, or None on a
-    # timeout; raises ClientClosed when the client has gone.
+    # recv with the short RECV_POLL_MS timeout. Returns bytes, or None on
+    # a timeout; raises ClientClosed when the client has gone.
     started = utime.ticks_ms()
 
     try:
         data = sock.recv(MAX_CHUNK)
 
     except Exception as e:
-        # Same test the working script uses for accept(): an exception
-        # after the full timeout is just "nothing arrived"; one that comes
-        # straight away is a real socket error.
+        # An exception after (most of) the timeout is just "nothing
+        # arrived"; one that comes straight away is a real socket error.
         elapsed = utime.ticks_diff(utime.ticks_ms(), started)
 
-        if elapsed >= (RECV_TIMEOUT_S - 1) * 1000:
+        if elapsed >= RECV_POLL_MS // 2:
             return None
 
         raise ClientClosed("recv error: %s" % e)
@@ -218,71 +220,34 @@ def uart_write_all(uart, data):
     return total
 
 
-def find_flag(buf):
-    # Index of the first HDLC 0x7E flag, or -1. Plain loop on purpose:
-    # "0x7E in bytearray" / .index(0x7E) failed on the EC200U with an
-    # exception that had an empty message.
-    for i in range(len(buf)):
-        if buf[i] == 0x7E:
-            return i
-    return -1
+def read_uart_burst(uart):
+    # Everything the meter sends, collected until UART_GAP_MS of silence
+    # (or MAX_CHUNK bytes) so one frame goes out as one TCP send. Nothing
+    # is filtered: noise bytes and unsolicited data are forwarded too.
+    burst = bytearray()
+    last_rx = utime.ticks_ms()
 
-
-def read_meter_reply(uart):
-    # Same timing as the working dlms_uart_probe.py: wait up to
-    # METER_REPLY_TIMEOUT_MS for data, then collect until FRAME_GAP_MS of
-    # silence. A noise byte right after the request (seen as 00/FC/FE in
-    # testing) is NOT the reply: bytes before the first 0x7E flag are
-    # dropped, and if a burst has no 0x7E at all we keep waiting for the
-    # real HDLC frame.
-    started = utime.ticks_ms()
-    reply = bytearray()
-    last_rx = started
-
-    while True:
-        now = utime.ticks_ms()
+    while len(burst) < MAX_CHUNK:
         available = uart.any()
 
         if available:
-            room = MAX_CHUNK - len(reply)
-            if room <= 0:
-                break
-
-            data = uart.read(min(available, room))
+            data = uart.read(min(available, MAX_CHUNK - len(burst)))
 
             if data:
-                reply.extend(data)
+                burst.extend(data)
                 last_rx = utime.ticks_ms()
 
-        elif reply and utime.ticks_diff(now, last_rx) >= FRAME_GAP_MS:
-            if find_flag(reply) >= 0:
-                break
-
-            # Only noise so far: drop it and keep waiting for the frame
-            trace("NOISE (dropped)", bytes(reply))
-            reply = bytearray()
-
-        elif utime.ticks_diff(now, started) >= METER_REPLY_TIMEOUT_MS:
+        elif utime.ticks_diff(utime.ticks_ms(), last_rx) >= UART_GAP_MS:
             break
 
         else:
-            utime.sleep_ms(5)
+            utime.sleep_ms(2)
 
-    start = find_flag(reply)
-
-    if start < 0:
-        if reply:
-            trace("NOISE (dropped)", bytes(reply))
-        return None
-
-    if start:
-        trace("NOISE (dropped)", bytes(reply[:start]))
-
-    return bytes(reply[start:])
+    return bytes(burst)
 
 
 def drain_uart(uart):
-    # Throw away stale or noise bytes before each request
+    # Throw away bytes that arrived while no client was connected
     discarded = 0
 
     while uart.any():
@@ -299,45 +264,51 @@ def drain_uart(uart):
 # -----------------------------------------
 
 def bridge(client, uart, ipv6):
-    # Request/response relay until the client leaves, goes idle,
-    # or the IPv6 address changes.
-    client.settimeout(RECV_TIMEOUT_S)
-    last_request = utime.ticks_ms()
+    # Transparent relay: every TCP byte goes to the meter UART and every
+    # UART byte goes to TCP, in both directions, until the client leaves,
+    # goes idle, or the IPv6 address changes.
+    client.settimeout(RECV_POLL_MS / 1000)
+    last_activity = utime.ticks_ms()
+    last_check = last_activity
+
+    # Bytes from before the connection have nowhere to go; sending them
+    # straight away would also make the module talk first.
+    discarded = drain_uart(uart)
+    if discarded:
+        print("Discarded", discarded, "UART bytes from before the connection")
 
     while True:
         hold_dtr()   # GPIO4 stays LOW
 
+        # TCP -> meter
         request = recv_request(client)
 
-        if request is None:
-            # recv timed out: check the address and the idle limit
+        if request:
+            last_activity = utime.ticks_ms()
+            trace("TCP->METER", request)
+            uart_write_all(uart, request)
+
+        # Meter -> TCP
+        if uart.any():
+            burst = read_uart_burst(uart)
+
+            if burst:
+                last_activity = utime.ticks_ms()
+                trace("METER->TCP", burst)
+                send_all(client, burst)
+
+        # Periodic checks: address and idle limit
+        now = utime.ticks_ms()
+
+        if utime.ticks_diff(now, last_check) >= CHECK_INTERVAL_S * 1000:
+            last_check = now
+
             if get_ipv6() != ipv6:
                 raise Exception("IPv6 address changed or PDP lost")
 
-            idle = utime.ticks_diff(utime.ticks_ms(), last_request)
-
-            if idle > IDLE_TIMEOUT_S * 1000:
-                print("No request for", IDLE_TIMEOUT_S, "s; closing")
+            if utime.ticks_diff(now, last_activity) > IDLE_TIMEOUT_S * 1000:
+                print("No data either way for", IDLE_TIMEOUT_S, "s; closing")
                 return
-
-            continue
-
-        last_request = utime.ticks_ms()
-        trace("TCP->METER", request)
-
-        discarded = drain_uart(uart)
-        if discarded:
-            print("Discarded", discarded, "stale UART bytes")
-
-        uart_write_all(uart, request)
-
-        reply = read_meter_reply(uart)
-
-        if reply:
-            trace("METER->TCP", reply)
-            send_all(client, reply)
-        else:
-            print("No meter reply within", METER_REPLY_TIMEOUT_MS, "ms")
 
 
 # -----------------------------------------

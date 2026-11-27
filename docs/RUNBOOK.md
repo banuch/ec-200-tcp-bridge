@@ -48,7 +48,7 @@ GXDLMSDirector (PC) ──SSH tunnel──► Vultr VM ──IPv6, TCP 5000─�
    - Note the `IPv6:` address. If it changed, update the VM (section 3.3).
 
 Settings at the top of `device/main.py`: `PORT`, `DEVICE_ID`,
-`METER_REPLY_TIMEOUT_MS` (4000), `FRAME_GAP_MS` (200), `IDLE_TIMEOUT_S` (120).
+`UART_GAP_MS` (200), `RECV_POLL_MS` (50), `IDLE_TIMEOUT_S` (120).
 
 ---
 
@@ -95,7 +95,7 @@ Connecting to module EC200U_001 at [...]:5000
 Module #1 (EC200U_001) connected ...
 DLMS #1 (EC200U_001): reading meter...
 DLMS #1: associated (client 32, server 0/1)
-Link #1 (EC200U_001) reconnected after 3 requests (EC200U limit)   <- normal, every 3 frames
+Link #1 (EC200U_001) reconnected after 3 requests / 3 replies (EC200U limit)   <- normal, every 3 frames
 ...
 Meter details via module #1
   [Identity] ... [Clock] ... [Instantaneous] ... [Energy] ...
@@ -183,11 +183,10 @@ and the meter itself private.
 
 | Behaviour | What the code does |
 |---|---|
-| Firmware resets a TCP connection on the first request after the module has sent **3 replies** on it (any bytes, any timing) | `server.py` `link_write()` reconnects every `MAX_REQUESTS_PER_LINK = 3` requests under the same link id. The meter session survives because DTR stays LOW. |
-| Non-blocking sockets, `uselect`, or the module sending first → firmware resets the connection | `device/main.py` uses only blocking recv-then-send |
-| `0x7E in bytearray` / `.index()` raise an empty exception | `find_flag()` uses a plain loop |
+| Firmware resets a TCP connection on the first request after the module has sent **3 replies** on it (any bytes, any timing) | `server.py` `link_write()` reconnects once 3 requests have been sent or 3 data chunks received (`MAX_REQUESTS_PER_LINK = 3`), under the same link id. The meter session survives because DTR stays LOW. |
+| Non-blocking sockets, `uselect`, or the module sending first → firmware resets the connection | `device/main.py` keeps the socket blocking with a short timeout and checks the UART between `recv()` calls. Unsolicited meter bytes are forwarded, so they may still trigger a reset. |
 | Meter is silent with GPIO4 HIGH | GPIO4 is set LOW at boot and never raised |
-| Single noise bytes (FF/FE/FC/00 ...) on UART | dropped before the first `0x7E` flag |
+| Single noise bytes (FF/FE/FC/00 ...) on UART | forwarded as-is; Gurux skips bytes before the `0x7E` flag |
 
 ---
 
@@ -196,7 +195,7 @@ and the meter itself private.
 | Symptom | Check / action |
 |---|---|
 | `Module EC200U_001 not reachable` | Module booted and shows `BRIDGE READY`? IPv6 changed (compare boot log with `modules`)? Data call up? |
-| Module log `No meter reply within 4000 ms` | Boot log shows `level: 0`? DB9 cable and GND (pin 5)? Loopback jumper removed? Run `device/dlms_uart_probe.py` (section 8). |
+| Module log shows `TCP->METER` with no `METER->TCP` after it | Boot log shows `level: 0`? DB9 cable and GND (pin 5)? Loopback jumper removed? Run `device/dlms_uart_probe.py` (section 8). |
 | `Link #N closed: socket error ConnectionResetError` in the middle of a read | Was `server.py` updated (`git pull`)? `MAX_REQUESTS_PER_LINK` must be 3. Run `server/link_test.py` to re-check the limit. |
 | `Module ... busy (PC or read running)` | Director or another read holds the link; wait or `kick <id>`. |
 | PC tool refused | `pipe EC200U_001` set? A read running (`autoread off` first)? |

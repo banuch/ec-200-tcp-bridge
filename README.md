@@ -37,10 +37,10 @@ The EC200U is the TCP **server** and the Vultr VM is the TCP **client**:
   and prints that address at boot (`IPv6: ...`).
 - `server/server.py` connects out to every module listed in
   `server/modules.json`.
-- Each exchange is request/response: the server sends a DLMS frame, the module
-  writes it to the meter UART, collects the reply until the line is quiet for
-  200 ms, and sends it back. The module never sends data on its own and never
-  restarts itself.
+- The module is a transparent bridge: every byte from TCP goes to the meter
+  UART and every byte from the UART goes back on TCP, with no filtering.
+  UART bytes are sent once the line has been quiet for 200 ms, so a meter
+  frame normally goes out in one TCP send. The module never restarts itself.
 - The EC200U firmware resets a TCP connection on the first request after the
   module has sent 3 replies on it. The server therefore opens a new
   connection every `MAX_REQUESTS_PER_LINK` (3) requests, without telling the
@@ -91,7 +91,7 @@ EC200U as `/usr/main.py` and reboot. Note the `IPv6:` address it prints and
 enter it on the server with `setmodule`.
 
 Test without a meter from the VM: `nc -6 <module-ipv6> 5000`, type a line,
-and the module log shows `TCP->METER` followed by `No meter reply`.
+and the module log shows `TCP->METER` (with no `METER->TCP` after it).
 
 Test the server without hardware: `python tools/pc_test.py 5055 ::1` on the
 same PC, then `setmodule TEST ::1 5055` and `poll TEST` on the server console.
