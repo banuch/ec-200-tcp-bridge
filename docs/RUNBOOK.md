@@ -37,8 +37,11 @@ GXDLMSDirector (PC) ──SSH tunnel──► Vultr VM ──IPv6, TCP 4059─�
 4. Check the boot log:
 
    ```
+   Heartbeat key loaded
    Meter UART2: 9600 8N1
    DTR GPIO4 held LOW, level: 0
+   [... ms] HEARTBEAT #1 sent (... bytes)
+   [... ms] HEARTBEAT #2 sent (... bytes)
    IPv6: 2401:4900:....::2
    Port: 4059
    BRIDGE READY
@@ -46,11 +49,14 @@ GXDLMSDirector (PC) ──SSH tunnel──► Vultr VM ──IPv6, TCP 4059─�
    ```
 
    - `level: 0` must be 0. If it is 1 the meter will not answer.
+   - Two heartbeats go out before the TCP server opens (also after every
+     rebind), so the VM learns a new address before it tries to connect.
    - Note the `IPv6:` address. If it changed, update the VM (section 3.3).
 
 Settings at the top of `device/main.py`: `PORT`, `DEVICE_ID`,
 `UART_GAP_MS` (200), `RECV_POLL_MS` (50), `IDLE_TIMEOUT_S` (120),
-`HEARTBEAT_HOST` (VM IPv6), `HEARTBEAT_PORT` (4060), `HEARTBEAT_INTERVAL_S` (300).
+`HEARTBEAT_HOST` (VM IPv6), `HEARTBEAT_PORT` (4060), `HEARTBEAT_INTERVAL_S` (300),
+`HEARTBEAT_STARTUP_COUNT` (2), `HEARTBEAT_STARTUP_GAP_MS` (2000).
 
 Also upload the heartbeat key to the module as `/usr/heartbeat_key.txt`
 (section 3.5). Without it the boot log shows
@@ -248,6 +254,7 @@ and the meter itself private.
 | Symptom | Check / action |
 |---|---|
 | `modules` shows `no heartbeat` | Module log shows `HEARTBEAT #n sent`? `HEARTBEAT_HOST` is the VM's IPv6? UDP 4060 open on the VM firewall (and in the Vultr firewall group)? |
+| Module log `Heartbeat failed at send: ... EHOSTUNREACH` | The UDP socket must be bound to the module's own IPv6 before `connect()` (`device/heartbeat.py` does this). Re-check with `device/heartbeat_route_test.py`: only test 4 passes on the EC200U; outbound TCP to the VM is blocked. |
 | `Heartbeat ... ignored: wrong signature` | `/usr/heartbeat_key.txt` on the module and `server/heartbeat_key.txt` differ |
 | `Module EC200U_001 not reachable` | Module booted and shows `BRIDGE READY`? IPv6 changed (compare boot log with `modules`)? Data call up? |
 | Module log shows `TCP->METER` with no `METER->TCP` after it | Boot log shows `level: 0`? DB9 cable and GND (pin 5)? Loopback jumper removed? Run `device/dlms_uart_probe.py` (section 8). |
@@ -280,6 +287,7 @@ first (or rename it) so both do not use UART2.
 |---|---|
 | `device/main.py` | production module bridge (`/usr/main.py` on the EC200U) |
 | `device/heartbeat.py` | UDP heartbeat sender (`/usr/heartbeat.py`; without it the bridge runs with heartbeats disabled) |
+| `device/heartbeat_route_test.py` | tries every way of sending outbound to the VM (finds what works on a new SIM/firmware) |
 | `server/server.py` | VM reader, scheduler, console, PC relay, reconnect logic |
 | `server/heartbeat.py` | heartbeat listener: signature check, live/offline, IPv6 auto-update |
 | `server/dlms_reader.py` | DLMS session, meter login settings, `READ_LIST` of OBIS objects |

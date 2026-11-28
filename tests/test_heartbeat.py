@@ -108,5 +108,52 @@ class HeartbeatTests(unittest.TestCase):
         self.assertIn("OFFLINE", self.monitor.state("EC200U_001"))
 
 
+class FakeSocket:
+    def __init__(self, calls):
+        self.calls = calls
+
+    def bind(self, addr):
+        self.calls.append(("bind", addr))
+
+    def connect(self, addr):
+        self.calls.append(("connect", addr))
+
+    def send(self, data):
+        self.calls.append(("send", len(data)))
+
+    def close(self):
+        self.calls.append(("close",))
+
+
+class DeviceSocketTests(unittest.TestCase):
+    """The EC200U only sends UDP after bind(own IPv6) + connect()."""
+
+    def setUp(self):
+        self.calls = []
+        self.real_usocket = DEVICE.usocket
+        DEVICE.usocket = types.SimpleNamespace(
+            AF_INET6=10, SOCK_DGRAM=2,
+            socket=lambda family, kind: FakeSocket(self.calls))
+        self.hb = DEVICE.Heartbeat("EC200U_001", "2401:db8::1", 4060, 300, "/no/such/file")
+
+    def tearDown(self):
+        DEVICE.usocket = self.real_usocket
+
+    def test_binds_own_address_before_connect(self):
+        self.hb.send(IP)
+        self.hb.send(IP)
+        self.assertEqual([c[0] for c in self.calls],
+                         ["bind", "connect", "send", "send"])
+        self.assertEqual(self.calls[0], ("bind", (IP, 0)))
+        self.assertEqual(self.calls[1], ("connect", ("2401:db8::1", 4060)))
+
+    def test_rebinds_when_address_changes(self):
+        self.hb.send(IP)
+        self.hb.send(NEW_IP)
+        self.assertEqual([c[0] for c in self.calls],
+                         ["bind", "connect", "send", "close", "bind", "connect", "send"])
+        self.assertEqual(self.calls[4], ("bind", (NEW_IP, 0)))
+
+
 if __name__ == "__main__":
     unittest.main()

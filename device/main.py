@@ -24,8 +24,9 @@
 # packet to the VM (HEARTBEAT_HOST, port HEARTBEAT_PORT) so the server
 # knows it is alive and learns its current IPv6 address. It is a separate
 # UDP socket, never the bridge connection, and is sent from the main loop
-# (no threads). The code is in heartbeat.py (upload as /usr/heartbeat.py);
-# if it is missing the bridge runs without heartbeats.
+# (no threads). At every (re)start HEARTBEAT_STARTUP_COUNT beats are sent
+# before the TCP server is opened. The code is in heartbeat.py (upload as
+# /usr/heartbeat.py); if it is missing the bridge runs without heartbeats.
 #
 # Nothing in this file restarts the module: no watchdog, no APN rewrite.
 
@@ -87,6 +88,8 @@ LED_ON = 1              # set to 0 if the LED is wired active-low
 HEARTBEAT_HOST = "2401:c080:2400:1480:5400:06ff:fe3d:7402"   # Vultr VM
 HEARTBEAT_PORT = 4060
 HEARTBEAT_INTERVAL_S = 300
+HEARTBEAT_STARTUP_COUNT = 2     # beats sent before the TCP server starts
+HEARTBEAT_STARTUP_GAP_MS = 2000 # pause between those beats
 HEARTBEAT_KEY_FILE = "/usr/heartbeat_key.txt"
 
 connection_count = 0
@@ -371,6 +374,14 @@ def serve(ipv6, uart):
     # then raises so main() can rebind.
     global connection_count
 
+    # Tell the VM the (possibly new) address first, then start the TCP
+    # server. Sent more than once in case the first UDP packet after the
+    # data call comes up is lost.
+    for n in range(HEARTBEAT_STARTUP_COUNT):
+        if n:
+            utime.sleep_ms(HEARTBEAT_STARTUP_GAP_MS)
+        hb_call("send", ipv6)
+
     server = usocket.socket(
         usocket.AF_INET6,
         usocket.SOCK_STREAM,
@@ -385,7 +396,6 @@ def serve(ipv6, uart):
         print("IPv6:", ipv6)
         print("Port:", PORT)
         print("BRIDGE READY")
-        hb_call("send", ipv6)   # at once: the server learns the address
 
         while True:
             hb_call("maybe", ipv6)

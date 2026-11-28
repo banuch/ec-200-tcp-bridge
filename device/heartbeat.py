@@ -76,6 +76,7 @@ class Heartbeat:
         self.interval_ms = interval_s * 1000
         self.key = load_key(key_file)
         self.sock = None
+        self.sock_ip = None         # own IPv6 the socket is bound to
         self.seq = 0
         self.last = None            # ticks_ms of the last beat attempt
         self.boot_ms = utime.ticks_ms()
@@ -117,9 +118,11 @@ class Heartbeat:
         return payload
 
     def send(self, ipv6):
-        # Same socket pattern as the working IPv6 tests: a plain (ip, port)
-        # tuple (no getaddrinfo) and a two-argument socket(). The UDP
-        # socket is connected once, then each beat is a send().
+        # The only pattern that works on the EC200U (heartbeat_route_test.py):
+        # bind the UDP socket to the module's own IPv6 address, connect it,
+        # then send(). Without the bind send() fails with EHOSTUNREACH, and
+        # sendto() fails with "invalid arguments". The socket is reused for
+        # every beat and rebuilt when the module's address changes.
         self.last = utime.ticks_ms()
         self.seq += 1
         step = "packet"
@@ -127,9 +130,15 @@ class Heartbeat:
         try:
             data = self.packet(ipv6)
 
+            if self.sock is not None and self.sock_ip != ipv6:
+                self.close()
+
             if self.sock is None:
                 step = "socket"
                 self.sock = usocket.socket(usocket.AF_INET6, usocket.SOCK_DGRAM)
+                step = "bind"
+                self.sock.bind((ipv6, 0))
+                self.sock_ip = ipv6
                 step = "connect"
                 self.sock.connect((self.host, self.port))
 
@@ -154,3 +163,4 @@ class Heartbeat:
         except Exception:
             pass
         self.sock = None
+        self.sock_ip = None
