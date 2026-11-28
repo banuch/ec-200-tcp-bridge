@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EC200U Bridge</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <h1>EC200U Bridge</h1>
+    <span id="updated" class="muted">loading…</span>
+  </header>
+
+  <main>
+    <div id="message" class="message" hidden></div>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Devices</h2>
+        <button id="add-btn" type="button">Add device</button>
+      </div>
+
+      <form id="device-form" class="device-form" hidden>
+        <h3 id="form-title">Add device</h3>
+        <label>Name <input id="f-name" required maxlength="32" pattern="[A-Za-z0-9_.\-]{1,32}" placeholder="EC200U_002"></label>
+        <label>IPv6 address <input id="f-host" required placeholder="2401:4900:…::2"></label>
+        <label>Port <input id="f-port" type="number" min="1" max="65535" required></label>
+        <div class="form-actions">
+          <button type="submit">Save</button>
+          <button type="button" id="form-cancel" class="secondary">Cancel</button>
+        </div>
+      </form>
+
+      <div class="table-wrap">
+        <table class="devices">
+          <thead>
+            <tr>
+              <th>Device</th><th>Status</th><th>Address</th><th>Signal</th>
+              <th>Uptime</th><th>Last read</th><th>Next read</th><th></th>
+            </tr>
+          </thead>
+          <tbody id="devices-body"></tbody>
+        </table>
+      </div>
+      <p id="no-devices" class="muted" hidden>No devices configured yet. Use “Add device”.</p>
+    </section>
+
+    <section id="detail" class="card" hidden>
+      <div class="card-head">
+        <h2 id="detail-title">Device</h2>
+        <div class="actions">
+          <button id="detail-read" type="button">Read now</button>
+          <button id="detail-close" type="button" class="secondary">Close</button>
+        </div>
+      </div>
+      <p id="detail-job" class="muted"></p>
+
+      <h3>Latest meter values</h3>
+      <p id="reading-time" class="muted"></p>
+      <div id="reading-groups" class="groups"></div>
+
+      <h3>Recent reads</h3>
+      <div class="table-wrap">
+        <table id="history" class="compact"></table>
+      </div>
+
+      <div class="card-head sub">
+        <h3>Profiles</h3>
+        <button id="detail-scan" type="button" class="secondary">Scan profiles</button>
+      </div>
+      <div class="table-wrap">
+        <table id="profiles" class="compact"></table>
+      </div>
+      <p id="no-profiles" class="muted" hidden>No profiles known yet. Run a read or “Scan profiles”.</p>
+
+      <div id="rows-box" hidden>
+        <div class="card-head sub">
+          <h3 id="rows-title">Profile rows</h3>
+          <button id="rows-close" type="button" class="secondary">Hide rows</button>
+        </div>
+        <div class="table-wrap">
+          <table id="rows" class="compact"></table>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

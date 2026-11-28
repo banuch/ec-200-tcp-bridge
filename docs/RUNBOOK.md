@@ -164,6 +164,50 @@ What the server does:
   address is never changed from them. Beats with a wrong signature, and
   repeated or old `seq` values, are dropped.
 
+### 3.6 Web dashboard (TCP 8080)
+
+`server.py` also serves a web page on port 8080: every device with its
+heartbeat (online / offline, signal, uptime), add / edit / delete devices,
+**Read now**, the latest meter values, the last 20 reads, and the profiles
+with their stored rows. It refreshes every 5 s.
+
+One-time setup on the VM (the password and certificate are never committed:
+they are in `.gitignore`):
+
+```bash
+cd ~/ec-200-tcp-bridge/server
+python3 -c "import secrets; print(secrets.token_urlsafe(16))" > web_password.txt
+chmod 600 web_password.txt
+cat web_password.txt                     # the dashboard password, user "admin"
+
+# HTTPS (recommended: without it the password crosses the internet in clear text)
+openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=ec200u-bridge" \
+  -keyout web_key.pem -out web_cert.pem
+chmod 600 web_key.pem
+
+sudo ufw allow 8080/tcp                  # if ufw is enabled
+```
+
+Also allow **TCP 8080** inbound in the Vultr firewall group. Restart
+`server.py`; the log shows `Web dashboard on https://*:8080 (user admin)`.
+Open `https://<vm-ipv4-or-[ipv6]>:8080` and log in as `admin`. The
+certificate is self-signed, so the browser warns once; accept it for this
+site.
+
+- No `web_password.txt` (and no `BRIDGE_WEB_PASSWORD`) → the log says
+  `Web dashboard NOT started: no password` and port 8080 stays closed.
+- No certificate → it still runs on plain `http://`, and the log warns that
+  the password is sent unencrypted.
+- **Read now** runs the same read as the 15-minute schedule; it is refused
+  (and the button greyed out) while a read, profile scan or GXDLMSDirector
+  session is using that module.
+- Every read (scheduled or from the page) is stored in
+  `bridge_data.sqlite3` (table `readings`), so the page shows the newest
+  values after a restart too.
+- Device names are the module `DEVICE_ID` (`EC200U_001`): the heartbeat and
+  stored data are matched by that name, so a device is edited (new address)
+  rather than renamed.
+
 ---
 
 ## 4. Server console commands
@@ -255,6 +299,7 @@ and the meter itself private.
 |---|---|
 | `modules` shows `no heartbeat` | Module log shows `HEARTBEAT #n sent`? `HEARTBEAT_HOST` is the VM's IPv6? UDP 4060 open on the VM firewall (and in the Vultr firewall group)? |
 | Module log `Heartbeat failed at send: ... EHOSTUNREACH` | The UDP socket must be bound to the module's own IPv6 before `connect()` (`device/heartbeat.py` does this). Re-check with `device/heartbeat_route_test.py`: only test 4 passes on the EC200U; outbound TCP to the VM is blocked. |
+| Dashboard does not open | Log shows `Web dashboard on ...`? (no password file → not started). TCP 8080 open in ufw and the Vultr firewall? `https://` when a certificate exists, `http://` when not. |
 | `Heartbeat ... ignored: wrong signature` | `/usr/heartbeat_key.txt` on the module and `server/heartbeat_key.txt` differ |
 | `Module EC200U_001 not reachable` | Module booted and shows `BRIDGE READY`? IPv6 changed (compare boot log with `modules`)? Data call up? |
 | Module log shows `TCP->METER` with no `METER->TCP` after it | Boot log shows `level: 0`? DB9 cable and GND (pin 5)? Loopback jumper removed? Run `device/dlms_uart_probe.py` (section 8). |
@@ -290,6 +335,7 @@ first (or rename it) so both do not use UART2.
 | `device/heartbeat_route_test.py` | tries every way of sending outbound to the VM (finds what works on a new SIM/firmware) |
 | `server/server.py` | VM reader, scheduler, console, PC relay, reconnect logic |
 | `server/heartbeat.py` | heartbeat listener: signature check, live/offline, IPv6 auto-update |
+| `server/web.py`, `server/web/` | web dashboard (HTTP API with password + the page) |
 | `server/dlms_reader.py` | DLMS session, meter login settings, `READ_LIST` of OBIS objects |
 | `server/profile_store.py` | SQLite store for profiles |
 | `server/modules.json` | module names and IPv6 addresses (VM only, not in git) |

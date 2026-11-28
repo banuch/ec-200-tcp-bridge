@@ -42,6 +42,10 @@ The EC200U is the TCP **server** and the Vultr VM is the TCP **client**:
   recently). The server shows modules as live/offline and updates a
   module's IPv6 address from a correctly signed beat. Setup: docs/RUNBOOK.md
   section 3.5.
+- A password-protected web dashboard on port 8080 shows the devices
+  (online / offline), lets you add or edit them, runs "Read now" and shows
+  the meter values and stored profile rows. Setup: docs/RUNBOOK.md
+  section 3.6.
 - The module is a transparent bridge: every byte from TCP goes to the meter
   UART and every byte from the UART goes back on TCP, with no filtering.
   UART bytes are sent once the line has been quiet for 200 ms, so a meter

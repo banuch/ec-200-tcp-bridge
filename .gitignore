@@ -9,3 +9,6 @@ bridge_log.txt
 *.sqlite3-shm
 *.sqlite3-wal
 heartbeat_key.txt
+web_password.txt
+web_cert.pem
+web_key.pem

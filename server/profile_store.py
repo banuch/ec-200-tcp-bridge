@@ -1,4 +1,4 @@
-"""SQLite persistence for discovered DLMS Profile Generic data."""
+"""SQLite persistence for DLMS meter readings and Profile Generic data."""
 
 import hashlib
 import json
@@ -82,6 +82,18 @@ class ProfileStore:
                 FOREIGN KEY (device_id, profile_obis)
                     REFERENCES profiles(device_id, obis) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS readings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL,
+                read_at TEXT NOT NULL,
+                ok INTEGER NOT NULL,
+                error TEXT,
+                values_json TEXT NOT NULL DEFAULT '[]'
+            );
+
+            CREATE INDEX IF NOT EXISTS readings_device_time
+                ON readings (device_id, id);
             """
         )
         self.db.commit()
@@ -323,3 +335,73 @@ class ProfileStore:
             (device_id,),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    # --- scalar meter readings (one row per read attempt) ---
+
+    def save_reading(self, device_id, values, error=None):
+        """values: [[group, label, obis, text], ...] from read_basic_connected."""
+        stamp = utc_now()
+        with self.db:
+            self.db.execute(
+                """
+                INSERT INTO readings (device_id, read_at, ok, error, values_json)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (device_id, stamp, 0 if error else 1,
+                 str(error)[:1000] if error else None,
+                 json.dumps([list(v) for v in values or []], ensure_ascii=False)),
+            )
+        return stamp
+
+    @staticmethod
+    def _reading(row):
+        item = dict(row)
+        item["ok"] = bool(item["ok"])
+        item["values"] = json.loads(item.pop("values_json") or "[]")
+        return item
+
+    def latest_reading(self, device_id, ok_only=True):
+        sql = "SELECT * FROM readings WHERE device_id = ?"
+        if ok_only:
+            sql += " AND ok = 1"
+        row = self.db.execute(sql + " ORDER BY id DESC LIMIT 1", (device_id,)).fetchone()
+        return self._reading(row) if row else None
+
+    def recent_readings(self, device_id, limit=20):
+        rows = self.db.execute(
+            "SELECT * FROM readings WHERE device_id = ? ORDER BY id DESC LIMIT ?",
+            (device_id, int(limit)),
+        ).fetchall()
+        return [self._reading(row) for row in rows]
+
+    # --- stored profile rows for display ---
+
+    def list_columns(self, device_id, obis):
+        rows = self.db.execute(
+            """
+            SELECT position, class_id, obis, attribute_index, data_index, description
+            FROM profile_columns
+            WHERE device_id = ? AND profile_obis = ?
+            ORDER BY position
+            """,
+            (device_id, obis),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_rows(self, device_id, obis, limit=50):
+        """Newest stored rows of a profile, newest first."""
+        rows = self.db.execute(
+            """
+            SELECT capture_time, collected_at, row_json FROM profile_rows
+            WHERE device_id = ? AND profile_obis = ?
+            ORDER BY COALESCE(capture_time, collected_at) DESC, id DESC
+            LIMIT ?
+            """,
+            (device_id, obis, int(limit)),
+        ).fetchall()
+        result = []
+        for row in rows:
+            item = json.loads(row["row_json"])
+            item["collected_at"] = row["collected_at"]
+            result.append(item)
+        return result

@@ -30,6 +30,11 @@ What it does
    modules.json itself. The shared key is read from heartbeat_key.txt next
    to this file or the BRIDGE_HB_KEY environment variable (never in git).
    The code is in heartbeat.py.
+ - Web dashboard on WEB_PORT (8080): devices online/offline, add/edit
+   devices, "Read now", latest meter values and stored profile rows.
+   Password from web_password.txt or BRIDGE_WEB_PASSWORD (never in git);
+   without one the dashboard does not start. HTTPS when web_cert.pem and
+   web_key.pem exist. The code is in web.py and web/index.html.
  - Console commands:
 
        modules                       configured modules and their state
@@ -58,6 +63,7 @@ import time
 
 import dlms_reader
 import heartbeat
+import web
 from profile_store import ProfileStore
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -99,6 +105,13 @@ HEARTBEAT_INTERVAL = 300    # seconds between beats (device HEARTBEAT_INTERVAL_S
 HEARTBEAT_MISSED = 3        # missed beats before a module is shown offline
 HEARTBEAT_KEY_FILE = os.environ.get(
     "BRIDGE_HB_KEY_FILE", os.path.join(HERE, "heartbeat_key.txt"))
+WEB_HOST = None             # web dashboard: None = all IPv4 + IPv6 interfaces
+WEB_PORT = 8080
+WEB_USER = "admin"
+WEB_PASSWORD_FILE = os.environ.get(
+    "BRIDGE_WEB_PASSWORD_FILE", os.path.join(HERE, "web_password.txt"))
+WEB_CERT_FILE = os.path.join(HERE, "web_cert.pem")
+WEB_KEY_FILE = os.path.join(HERE, "web_key.pem")
 PROFILE_COLLECTION_ENABLED = True
 PROFILE_DB_FILE = os.environ.get(
     "BRIDGE_PROFILE_DB", os.path.join(HERE, "bridge_data.sqlite3"))
@@ -116,6 +129,8 @@ relinking = set()           # module writers being replaced by a new connection
 link_requests = {}          # link id -> requests sent on its current connection
 link_replies = {}           # link id -> data chunks received on its current connection
 tasks = set()               # running background tasks (keeps references alive)
+read_state = {}             # module name -> {running, what, started, finished, ok, error}
+next_read_at = {}           # module name -> time.time() of the next scheduled read
 next_id = 1
 profile_store = ProfileStore(PROFILE_DB_FILE)
 heartbeats = heartbeat.HeartbeatMonitor(
@@ -358,25 +373,81 @@ async def module_reader(cid, reader, writer, addr):
 # Scheduled reads
 # ---------------------------------------------------------------------------
 
+def set_read_state(name, **fields):
+    state = read_state.setdefault(name, {
+        "running": False, "what": None, "started": None, "finished": None,
+        "ok": None, "error": None})
+    state.update(fields)
+
+
+def module_busy(name):
+    """Why a read cannot start on this module now, or None."""
+    state = read_state.get(name)
+    if state and state.get("running"):
+        return "a {} is already running".format(state.get("what") or "read")
+    cid = live_cid(name)
+    if cid is not None and cid in pc_links:
+        return "a PC is piped to this module"
+    if cid is not None and cid in sessions:
+        return "a DLMS session is running on this module"
+    return None
+
+
+def claim(name, what):
+    """Mark a read/scan as running. Returns None, or why it cannot start."""
+    if name not in modules:
+        return "unknown module"
+    busy = module_busy(name)
+    if busy:
+        return busy
+    set_read_state(name, running=True, what=what, started=time.time(),
+                   finished=None, ok=None, error=None)
+    return None
+
+
 async def poll_once(name):
     """Connect, read the meter, disconnect. Returns seconds until next try."""
     if name not in modules:
         return None
+    busy = claim(name, "read")
+    if busy:
+        log("Module {} busy ({}); retrying in {}s".format(
+            name, busy, AUTO_READ_RETRY))
+        return AUTO_READ_RETRY
+    return await run_read(name)
+
+
+async def run_read(name):
+    """One read of a module already claimed with claim(name, "read")."""
+    try:
+        return await _read_module(name)
+    except Exception as error:
+        set_read_state(name, ok=False, error=repr(error))
+        raise
+    finally:
+        set_read_state(name, running=False, finished=time.time())
+
+
+async def _read_module(name):
     try:
         cid = await open_link(name)
     except (OSError, asyncio.TimeoutError, ValueError) as error:
         log("Module {} not reachable: {!r}; retrying in {}s".format(
             name, error, CONNECT_RETRY))
+        set_read_state(name, ok=False, error="not reachable: {!r}".format(error))
         return CONNECT_RETRY
 
     if cid in pc_links or cid in sessions:
         log("Module {} busy (PC or read running); retrying in {}s".format(
             label(cid), AUTO_READ_RETRY))
+        set_read_state(name, ok=False, error="busy (PC or read running)")
         return AUTO_READ_RETRY
 
     await asyncio.sleep(AUTO_READ_DELAY)
     success = await read_meter(cid)
     close_link(cid)
+    set_read_state(name, ok=success,
+                   error=None if success else "meter read failed (see log)")
 
     if success:
         log("Scheduled read {} complete; next in {}s".format(name, READ_INTERVAL))
@@ -390,15 +461,18 @@ async def scheduler(name, first_delay):
     try:
         await asyncio.sleep(first_delay)
         while name in modules:
+            next_read_at.pop(name, None)
             delay = await poll_once(name)
             if delay is None:
                 return
+            next_read_at[name] = time.time() + delay
             await asyncio.sleep(delay)
     except asyncio.CancelledError:
         pass
     finally:
         if schedulers.get(name) is asyncio.current_task():
             schedulers.pop(name, None)
+            next_read_at.pop(name, None)
 
 
 def start_scheduler(name, first_delay=0):
@@ -513,6 +587,7 @@ async def read_meter(cid):
             include_profiles=PROFILE_COLLECTION_ENABLED,
         )
         log(dlms_reader.format_results(cid, results))
+        profile_store.save_reading(device_key(cid), results)
         for result in profiles:
             if result["status"] == "complete":
                 log("PROFILE {} {}: read={}, new={}".format(
@@ -525,8 +600,11 @@ async def read_meter(cid):
         success = True
     except dlms_reader.LinkClosed:
         log("DLMS {}: module disconnected during read".format(label(cid)))
+        profile_store.save_reading(device_key(cid), [],
+                                   "module disconnected during read")
     except Exception as e:
         log("DLMS {}: read failed: {!r}".format(label(cid), e))
+        profile_store.save_reading(device_key(cid), [], repr(e))
     finally:
         sessions.pop(cid, None)
     return success
@@ -592,6 +670,127 @@ async def poll_command(name):
     await poll_once(name)
 
 
+async def run_scan(name):
+    """Profile scan of a module already claimed with claim(name, "profile scan")."""
+    try:
+        cid = await open_link(name)
+        try:
+            await scan_meter_profiles(cid)
+        finally:
+            close_link(cid)
+        set_read_state(name, ok=True)
+    except (OSError, asyncio.TimeoutError, ValueError) as error:
+        log("Profile scan {} failed: {!r}".format(name, error))
+        set_read_state(name, ok=False, error="scan failed: {!r}".format(error))
+    finally:
+        set_read_state(name, running=False, finished=time.time())
+
+
+# ---------------------------------------------------------------------------
+# Module list changes (console and web)
+# ---------------------------------------------------------------------------
+
+def set_module(name, host, port=MODULE_PORT):
+    """Add a module or change its address; saved and scheduled at once."""
+    modules[name] = {"host": str(host).strip("[]"), "port": int(port)}
+    save_modules()
+    log("Module {} -> [{}]:{} (saved)".format(name, modules[name]["host"], port))
+    start_scheduler(name)
+
+
+def delete_module(name):
+    """Remove a module; returns False if it was not configured."""
+    if modules.pop(name, None) is None:
+        return False
+    save_modules()
+    task = schedulers.pop(name, None)
+    if task:
+        task.cancel()
+    next_read_at.pop(name, None)
+    log("Module {} removed".format(name))
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Web dashboard glue (web.py)
+# ---------------------------------------------------------------------------
+
+def device_status(name):
+    """Everything the dashboard shows for one module."""
+    entry = modules.get(name, {})
+    beat = heartbeats.beats.get(name)
+    cid = live_cid(name)
+    state = read_state.get(name) or {}
+    last = profile_store.latest_reading(name, ok_only=False)
+    return {
+        "name": name,
+        "host": entry.get("host"),
+        "port": entry.get("port"),
+        "heartbeat": None if beat is None else {
+            "online": bool(beat.get("online")),
+            "age": int(time.time() - beat["at"]),
+            "seq": beat.get("seq"),
+            "up": beat.get("up"),
+            "ip": beat.get("ip"),
+            "csq": beat.get("csq"),
+            "client": beat.get("client"),
+            "meter_age": beat.get("meter_age"),
+            "signed": bool(beat.get("signed")),
+        },
+        "link": cid,
+        "pc": cid is not None and cid in pc_links,
+        "busy": module_busy(name),
+        "job": {
+            "running": bool(state.get("running")),
+            "what": state.get("what"),
+            "started": state.get("started"),
+            "finished": state.get("finished"),
+            "ok": state.get("ok"),
+            "error": state.get("error"),
+        },
+        "last_reading": None if last is None else {
+            "read_at": last["read_at"], "ok": last["ok"], "error": last["error"]},
+        "next_read_at": next_read_at.get(name),
+    }
+
+
+def start_read(name):
+    """Start a read now. Returns None, or why it cannot start."""
+    why = claim(name, "read")
+    if why is None:
+        start_task(run_read(name))
+    return why
+
+
+def start_scan(name):
+    """Start a profile scan now. Returns None, or why it cannot start."""
+    why = claim(name, "profile scan")
+    if why is None:
+        start_task(run_scan(name))
+    return why
+
+
+def load_web_password():
+    password = os.environ.get("BRIDGE_WEB_PASSWORD", "").strip()
+    if not password and os.path.exists(WEB_PASSWORD_FILE):
+        with open(WEB_PASSWORD_FILE, encoding="utf-8") as f:
+            password = f.read().strip()
+    return password or None
+
+
+def web_backend():
+    return web.Backend(
+        modules=modules,
+        device_status=device_status,
+        set_module=set_module,
+        delete_module=delete_module,
+        start_read=start_read,
+        start_scan=start_scan,
+        store=profile_store,
+        module_port=MODULE_PORT,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Console
 # ---------------------------------------------------------------------------
@@ -633,21 +832,11 @@ async def console():
             elif cmd == "heartbeat":
                 heartbeats.print_all()
             elif cmd == "setmodule" and len(args) in (3, 4):
-                name = args[1]
                 port = int(args[3]) if len(args) == 4 else MODULE_PORT
-                modules[name] = {"host": args[2].strip("[]"), "port": port}
-                save_modules()
-                print("Module {} -> [{}]:{} (saved)".format(name, modules[name]["host"], port))
-                start_scheduler(name)
+                set_module(args[1], args[2], port)
             elif cmd == "delmodule" and len(args) == 2:
-                if modules.pop(args[1], None) is None:
+                if not delete_module(args[1]):
                     print("Unknown module", args[1])
-                else:
-                    save_modules()
-                    task = schedulers.pop(args[1], None)
-                    if task:
-                        task.cancel()
-                    print("Removed", args[1])
             elif cmd == "connect" and len(args) == 2:
                 start_task(connect_command(args[1]))
             elif cmd == "poll" and len(args) == 2:
@@ -738,6 +927,9 @@ async def main():
     log("PC relay listening on [{}]:{}".format(PC_HOST, PC_PORT))
     await heartbeats.start(HEARTBEAT_HOST, HEARTBEAT_PORT)
     start_task(heartbeats.watch())
+    web_server = await web.start(
+        web_backend(), WEB_HOST, WEB_PORT, WEB_USER, load_web_password(),
+        WEB_CERT_FILE, WEB_KEY_FILE, log)
     for index, name in enumerate(list(modules)):
         start_scheduler(name, index * STARTUP_STAGGER)
     async with pc_server:
