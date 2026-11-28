@@ -164,9 +164,9 @@ What the server does:
   address is never changed from them. Beats with a wrong signature, and
   repeated or old `seq` values, are dropped.
 
-### 3.6 Web dashboard (TCP 8080)
+### 3.6 Web dashboard (TCP 3001)
 
-`server.py` also serves a web page on port 8080: every device with its
+`server.py` also serves a web page on port 3001: every device with its
 heartbeat (online / offline, signal, uptime), add / edit / delete devices,
 **Read now**, the latest meter values, the last 20 reads, and the profiles
 with their stored rows. It refreshes every 5 s.
@@ -185,19 +185,25 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=ec200u-bridge" \
   -keyout web_key.pem -out web_cert.pem
 chmod 600 web_key.pem
 
-sudo ufw allow 8080/tcp                  # if ufw is enabled
+sudo ufw allow 3001/tcp                  # if ufw is enabled
 ```
 
-Also allow **TCP 8080** inbound in the Vultr firewall group. Restart
-`server.py`; the log shows `Web dashboard on https://*:8080 (user admin)`.
-Open `https://<vm-ipv4-or-[ipv6]>:8080` and log in as `admin`. The
+Also allow **TCP 3001** inbound in the Vultr firewall group. Restart
+`server.py`; the log shows `Web dashboard on https://*:3001 (user admin)`.
+Open `https://<vm-ipv4-or-[ipv6]>:3001` and log in as `admin`. The
 certificate is self-signed, so the browser warns once; accept it for this
 site.
 
 - No `web_password.txt` (and no `BRIDGE_WEB_PASSWORD`) → the log says
-  `Web dashboard NOT started: no password` and port 8080 stays closed.
+  `Web dashboard NOT started: no password` and port 3001 stays closed.
 - No certificate → it still runs on plain `http://`, and the log warns that
   the password is sent unencrypted.
+- Port 3001 already used by something else → the log says `Web dashboard NOT
+  started: cannot listen on port 3001` and the bridge keeps running. Find it
+  with `sudo lsof -nP -iTCP:3001 -sTCP:LISTEN`, or start with another port:
+  `BRIDGE_WEB_PORT=3002 python3 server.py` (open that port instead).
+  Port 8080 is not used because `relay-webapp.service` (the GPIO2 relay web
+  app) already listens there on the VM.
 - **Read now** runs the same read as the 15-minute schedule; it is refused
   (and the button greyed out) while a read, profile scan or GXDLMSDirector
   session is using that module.
@@ -299,7 +305,7 @@ and the meter itself private.
 |---|---|
 | `modules` shows `no heartbeat` | Module log shows `HEARTBEAT #n sent`? `HEARTBEAT_HOST` is the VM's IPv6? UDP 4060 open on the VM firewall (and in the Vultr firewall group)? |
 | Module log `Heartbeat failed at send: ... EHOSTUNREACH` | The UDP socket must be bound to the module's own IPv6 before `connect()` (`device/heartbeat.py` does this). Re-check with `device/heartbeat_route_test.py`: only test 4 passes on the EC200U; outbound TCP to the VM is blocked. |
-| Dashboard does not open | Log shows `Web dashboard on ...`? (no password file → not started). TCP 8080 open in ufw and the Vultr firewall? `https://` when a certificate exists, `http://` when not. |
+| Dashboard does not open | Log shows `Web dashboard on ...`? (no password file → not started). TCP 3001 open in ufw and the Vultr firewall? `https://` when a certificate exists, `http://` when not. |
 | `Heartbeat ... ignored: wrong signature` | `/usr/heartbeat_key.txt` on the module and `server/heartbeat_key.txt` differ |
 | `Module EC200U_001 not reachable` | Module booted and shows `BRIDGE READY`? IPv6 changed (compare boot log with `modules`)? Data call up? |
 | Module log shows `TCP->METER` with no `METER->TCP` after it | Boot log shows `level: 0`? DB9 cable and GND (pin 5)? Loopback jumper removed? Run `device/dlms_uart_probe.py` (section 8). |

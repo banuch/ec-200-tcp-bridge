@@ -43,7 +43,7 @@ async function api(method, path, body) {
     options.body = JSON.stringify(body);
   }
   // location.origin has no user:password, so this also works when the page
-  // was opened as http://admin:password@host:8080/
+  // was opened as http://admin:password@host:3001/
   const response = await fetch(location.origin + path, options);
   let data = {};
   try { data = await response.json(); } catch (e) { /* empty body */ }

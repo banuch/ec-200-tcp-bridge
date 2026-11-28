@@ -365,9 +365,16 @@ async def start(backend, host, port, user, password, cert_file, key_file, log):
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(cert_file, key_file)
 
-    server = await asyncio.start_server(
-        lambda r, w: serve_connection(app, r, w), host, port,
-        ssl=context, limit=MAX_HEADER_BYTES)
+    try:
+        server = await asyncio.start_server(
+            lambda r, w: serve_connection(app, r, w), host, port,
+            ssl=context, limit=MAX_HEADER_BYTES)
+    except OSError as exc:
+        # The dashboard must never stop the bridge itself
+        log("Web dashboard NOT started: cannot listen on port {} ({}). "
+            "The bridge keeps running. Free the port or set "
+            "BRIDGE_WEB_PORT to another one.".format(port, exc.strerror or exc))
+        return None
     scheme = "https" if context else "http"
     log("Web dashboard on {}://{}:{} (user {})".format(
         scheme, "[{}]".format(host) if host and ":" in host else (host or "*"),

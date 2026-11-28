@@ -30,7 +30,7 @@ What it does
    modules.json itself. The shared key is read from heartbeat_key.txt next
    to this file or the BRIDGE_HB_KEY environment variable (never in git).
    The code is in heartbeat.py.
- - Web dashboard on WEB_PORT (8080): devices online/offline, add/edit
+ - Web dashboard on WEB_PORT (3001): devices online/offline, add/edit
    devices, "Read now", latest meter values and stored profile rows.
    Password from web_password.txt or BRIDGE_WEB_PASSWORD (never in git);
    without one the dashboard does not start. HTTPS when web_cert.pem and
@@ -106,7 +106,7 @@ HEARTBEAT_MISSED = 3        # missed beats before a module is shown offline
 HEARTBEAT_KEY_FILE = os.environ.get(
     "BRIDGE_HB_KEY_FILE", os.path.join(HERE, "heartbeat_key.txt"))
 WEB_HOST = None             # web dashboard: None = all IPv4 + IPv6 interfaces
-WEB_PORT = 8080
+WEB_PORT = int(os.environ.get("BRIDGE_WEB_PORT", "3001"))
 WEB_USER = "admin"
 WEB_PASSWORD_FILE = os.environ.get(
     "BRIDGE_WEB_PASSWORD_FILE", os.path.join(HERE, "web_password.txt"))

@@ -211,6 +211,28 @@ class WebTests(unittest.TestCase):
         self.assertEqual(response.status, 400)
 
 
+class StartTests(unittest.TestCase):
+    def test_busy_port_does_not_stop_the_bridge(self):
+        import socket
+        busy = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        busy.bind(("127.0.0.1", 0))
+        busy.listen(1)
+        port = busy.getsockname()[1]
+        lines = []
+        tmp = tempfile.TemporaryDirectory()
+        store = ProfileStore(os.path.join(tmp.name, "t.sqlite3"))
+        try:
+            result = asyncio.run(web.start(
+                FakeServer(store).backend(), "127.0.0.1", port, USER, PASSWORD,
+                "/no/cert", "/no/key", lines.append))
+        finally:
+            busy.close()
+            store.close()
+            tmp.cleanup()
+        self.assertIsNone(result)
+        self.assertTrue(any("NOT started" in line and str(port) in line for line in lines))
+
+
 class HttpParsingTests(unittest.TestCase):
     def parse(self, raw):
         async def run():
