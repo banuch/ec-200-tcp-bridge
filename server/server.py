@@ -29,6 +29,7 @@ What it does
    when a correctly signed beat comes from a new IPv6 address, updates
    modules.json itself. The shared key is read from heartbeat_key.txt next
    to this file or the BRIDGE_HB_KEY environment variable (never in git).
+   The code is in heartbeat.py.
  - Console commands:
 
        modules                       configured modules and their state
@@ -49,9 +50,6 @@ Meter addresses / password live in dlms_reader.py.
 """
 import asyncio
 import binascii
-import hashlib
-import hmac
-import ipaddress
 import json
 import os
 import socket
@@ -59,6 +57,7 @@ import sys
 import time
 
 import dlms_reader
+import heartbeat
 from profile_store import ProfileStore
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -116,10 +115,13 @@ closing = set()             # module writers this server closed itself
 relinking = set()           # module writers being replaced by a new connection
 link_requests = {}          # link id -> requests sent on its current connection
 link_replies = {}           # link id -> data chunks received on its current connection
-heartbeats = {}             # device id -> last beat (fields + at/src/signed/online)
 tasks = set()               # running background tasks (keeps references alive)
 next_id = 1
 profile_store = ProfileStore(PROFILE_DB_FILE)
+heartbeats = heartbeat.HeartbeatMonitor(
+    modules, lambda: save_modules(), lambda line: log(line),
+    key=heartbeat.load_key(HEARTBEAT_KEY_FILE),
+    interval=HEARTBEAT_INTERVAL, missed=HEARTBEAT_MISSED)
 
 
 def log(line):
@@ -185,133 +187,6 @@ def live_cid(name):
         if n == name and cid in clients:
             return cid
     return None
-
-
-# ---------------------------------------------------------------------------
-# Heartbeat (UDP from the modules)
-# ---------------------------------------------------------------------------
-
-def load_heartbeat_key():
-    key = os.environ.get("BRIDGE_HB_KEY", "").strip()
-    if not key and os.path.exists(HEARTBEAT_KEY_FILE):
-        with open(HEARTBEAT_KEY_FILE, encoding="utf-8") as f:
-            key = f.read().strip()
-    return key.encode() or None
-
-
-heartbeat_key = load_heartbeat_key()
-
-
-def same_ip(a, b):
-    try:
-        return (ipaddress.ip_address(str(a).split("%")[0])
-                == ipaddress.ip_address(str(b).split("%")[0]))
-    except ValueError:
-        return False
-
-
-def handle_heartbeat(data, src):
-    """One UDP datagram: JSON, optionally followed by "|<hex HMAC-SHA256>"."""
-    if len(data) > 1024:
-        return
-    payload, sig = data, None
-    if b"|" in data:
-        payload, sig = data.rsplit(b"|", 1)
-    try:
-        beat = json.loads(payload.decode("utf-8"))
-        name = beat["id"]
-        if not isinstance(name, str):
-            raise ValueError("id is not a string")
-        seq, up = int(beat.get("seq", 0)), int(beat.get("up", 0))
-    except (ValueError, KeyError, TypeError, AttributeError,
-            UnicodeDecodeError) as error:
-        log("Heartbeat from [{}] ignored: bad packet ({})".format(src, error))
-        return
-
-    signed = False
-    if sig is not None and heartbeat_key:
-        good = hmac.new(heartbeat_key, payload, hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(good.encode(), sig.strip().lower()):
-            log("Heartbeat '{}' from [{}] ignored: wrong signature".format(name, src))
-            return
-        signed = True
-
-    prev = heartbeats.get(name)
-    rebooted = prev is not None and up < prev.get("up", 0)
-    newer = prev is None or rebooted or seq > prev.get("seq", 0)
-    if not newer:
-        return                          # duplicate or replayed beat
-
-    beat.update(at=time.time(), src=src, signed=signed, online=True)
-    heartbeats[name] = beat
-
-    if prev is None or not prev.get("online"):
-        log("Heartbeat: {} ONLINE from [{}]".format(name, src))
-    elif rebooted:
-        log("Heartbeat: {} rebooted (up {}s)".format(name, up))
-    log("HEARTBEAT {} #{} up={}s csq={} client={} meter_age={} {}".format(
-        name, seq, up, beat.get("csq"), beat.get("client"),
-        beat.get("meter_age"), "signed" if signed else "UNSIGNED"))
-
-    ip = beat.get("ip")
-    entry = modules.get(name)
-    if entry is None:
-        log("Heartbeat: {} is not a configured module (setmodule {} {})".format(
-            name, name, ip))
-        return
-    if not ip or same_ip(entry["host"], ip):
-        return
-    if not signed:
-        log("Heartbeat: {} reports IPv6 {} (configured {}); unsigned, so not "
-            "changed: run setmodule {} {}".format(name, ip, entry["host"], name, ip))
-    elif not same_ip(src, ip):
-        log("Heartbeat: {} reports IPv6 {} but came from [{}]; not changed".format(
-            name, ip, src))
-    else:
-        old = entry["host"]
-        entry["host"] = str(ip).strip("[]")
-        save_modules()
-        log("Module {} IPv6 changed {} -> {} (from heartbeat, saved)".format(
-            name, old, entry["host"]))
-
-
-class HeartbeatProtocol(asyncio.DatagramProtocol):
-    def datagram_received(self, data, addr):
-        try:
-            handle_heartbeat(data, addr[0])
-        except Exception as error:      # never let one packet stop the listener
-            log("Heartbeat from {} failed: {!r}".format(addr, error))
-
-
-async def heartbeat_monitor():
-    """Mark modules offline after HEARTBEAT_MISSED missed beats."""
-    limit = HEARTBEAT_INTERVAL * HEARTBEAT_MISSED
-    while True:
-        await asyncio.sleep(30)
-        now = time.time()
-        for name, beat in heartbeats.items():
-            if beat.get("online") and now - beat["at"] > limit:
-                beat["online"] = False
-                log("Heartbeat: {} OFFLINE (no beat for {}s)".format(
-                    name, int(now - beat["at"])))
-
-
-def heartbeat_state(name):
-    beat = heartbeats.get(name)
-    if beat is None:
-        return "no heartbeat"
-    return "{} (beat {}s ago)".format(
-        "live" if beat.get("online") else "OFFLINE", int(time.time() - beat["at"]))
-
-
-def print_heartbeats():
-    if not heartbeats:
-        print("(no heartbeat received yet)")
-    for name, beat in heartbeats.items():
-        print("  {:<14} {}  #{} up={}s ip={} csq={} client={} meter_age={} {}".format(
-            name, heartbeat_state(name), beat.get("seq"), beat.get("up"),
-            beat.get("ip"), beat.get("csq"), beat.get("client"),
-            beat.get("meter_age"), "signed" if beat.get("signed") else "UNSIGNED"))
 
 
 # ---------------------------------------------------------------------------
@@ -728,7 +603,7 @@ def print_modules():
         cid = live_cid(name)
         state = "link {}".format(cid) if cid is not None else "not connected"
         print("  {:<14} [{}]:{}  {}  heartbeat: {}".format(
-            name, entry["host"], entry["port"], state, heartbeat_state(name)))
+            name, entry["host"], entry["port"], state, heartbeats.state(name)))
 
 
 async def console():
@@ -756,7 +631,7 @@ async def console():
             if cmd == "modules":
                 print_modules()
             elif cmd == "heartbeat":
-                print_heartbeats()
+                heartbeats.print_all()
             elif cmd == "setmodule" and len(args) in (3, 4):
                 name = args[1]
                 port = int(args[3]) if len(args) == 4 else MODULE_PORT
@@ -861,14 +736,8 @@ async def main():
         "{} [{}]:{}".format(n, e["host"], e["port"]) for n, e in modules.items())
         or "none"))
     log("PC relay listening on [{}]:{}".format(PC_HOST, PC_PORT))
-    await asyncio.get_running_loop().create_datagram_endpoint(
-        HeartbeatProtocol, local_addr=(HEARTBEAT_HOST, HEARTBEAT_PORT),
-        family=socket.AF_INET6)
-    log("Heartbeat listening on UDP [{}]:{} ({})".format(
-        HEARTBEAT_HOST, HEARTBEAT_PORT,
-        "key loaded" if heartbeat_key else "NO KEY: beats accepted unsigned, "
-        "addresses never auto-updated"))
-    start_task(heartbeat_monitor())
+    await heartbeats.start(HEARTBEAT_HOST, HEARTBEAT_PORT)
+    start_task(heartbeats.watch())
     for index, name in enumerate(list(modules)):
         start_scheduler(name, index * STARTUP_STAGGER)
     async with pc_server:

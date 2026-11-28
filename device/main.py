@@ -24,18 +24,24 @@
 # packet to the VM (HEARTBEAT_HOST, port HEARTBEAT_PORT) so the server
 # knows it is alive and learns its current IPv6 address. It is a separate
 # UDP socket, never the bridge connection, and is sent from the main loop
-# (no threads). See heartbeat_packet() for the format.
+# (no threads). The code is in heartbeat.py (upload as /usr/heartbeat.py);
+# if it is missing the bridge runs without heartbeats.
 #
 # Nothing in this file restarts the module: no watchdog, no APN rewrite.
 
 import usocket
 import dataCall
-import net
 import ubinascii
-import uhashlib
-import ujson
 import utime
 from machine import Pin, UART
+
+try:
+    from usr.heartbeat import Heartbeat
+except ImportError:
+    try:
+        from heartbeat import Heartbeat
+    except ImportError:
+        Heartbeat = None
 
 # -----------------------------------------
 # Settings
@@ -84,9 +90,6 @@ HEARTBEAT_INTERVAL_S = 300
 HEARTBEAT_KEY_FILE = "/usr/heartbeat_key.txt"
 
 connection_count = 0
-client_connected = False
-last_meter_rx = None        # ticks_ms of the last byte from the meter
-boot_ms = utime.ticks_ms()
 
 
 # -----------------------------------------
@@ -173,108 +176,28 @@ class ClientClosed(Exception):
 
 
 # -----------------------------------------
-# Heartbeat (UDP to the VM)
+# Heartbeat (UDP to the VM, see heartbeat.py)
 # -----------------------------------------
 
-def load_heartbeat_key():
+hb = None
+if Heartbeat is None:
+    print("No heartbeat.py on the module - heartbeats disabled")
+else:
     try:
-        with open(HEARTBEAT_KEY_FILE) as f:
-            key = f.read().strip()
-        if key:
-            print("Heartbeat key loaded")
-            return key.encode()
-    except Exception:
-        pass
-    print("No", HEARTBEAT_KEY_FILE, "- heartbeats will be unsigned")
-    return None
-
-
-def hmac_sha256(key, msg):
-    # QuecPython has no hmac module; standard HMAC (RFC 2104) on sha256
-    if len(key) > 64:
-        key = uhashlib.sha256(key).digest()
-    key = key + b"\x00" * (64 - len(key))
-    inner = uhashlib.sha256(bytes([b ^ 0x36 for b in key]) + msg).digest()
-    return uhashlib.sha256(bytes([b ^ 0x5C for b in key]) + inner).digest()
-
-
-hb_key = load_heartbeat_key()
-hb_sock = None
-hb_seq = 0
-hb_last = None              # ticks_ms of the last beat attempt
-
-
-def heartbeat_packet(ipv6):
-    # One JSON line, then "|" and the hex HMAC-SHA256 of the JSON bytes
-    # when a key is loaded. Fields:
-    #   id         DEVICE_ID
-    #   seq        beat number since boot (starts at 1)
-    #   up         seconds since boot
-    #   ip         current IPv6 address
-    #   csq        signal quality 0..31 (99 = unknown)
-    #   client     1 if the VM is connected to the bridge now
-    #   meter_age  seconds since the meter last sent a byte (-1 = never)
-    up = utime.ticks_diff(utime.ticks_ms(), boot_ms) // 1000
-
-    if last_meter_rx is None:
-        meter_age = -1
-    else:
-        meter_age = utime.ticks_diff(utime.ticks_ms(), last_meter_rx) // 1000
-
-    csq = safe_call(net.csqQueryPoll)
-
-    payload = ujson.dumps({
-        "id": DEVICE_ID,
-        "seq": hb_seq,
-        "up": up,
-        "ip": ipv6,
-        "csq": csq if isinstance(csq, int) else 99,
-        "client": 1 if client_connected else 0,
-        "meter_age": meter_age,
-    }).encode()
-
-    if hb_key:
-        return payload + b"|" + ubinascii.hexlify(hmac_sha256(hb_key, payload))
-    return payload
-
-
-def send_heartbeat(ipv6):
-    # Never raises: a lost beat must not disturb the bridge
-    # Same socket pattern as the working IPv6 tests: a plain (ip, port)
-    # tuple (no getaddrinfo) and a two-argument socket(). The UDP socket is
-    # connected once, then each beat is a send().
-    global hb_sock, hb_seq, hb_last
-    hb_last = utime.ticks_ms()
-    hb_seq += 1
-    step = "packet"
-
-    try:
-        packet = heartbeat_packet(ipv6)
-
-        if hb_sock is None:
-            step = "socket"
-            hb_sock = usocket.socket(usocket.AF_INET6, usocket.SOCK_DGRAM)
-            step = "connect"
-            hb_sock.connect((HEARTBEAT_HOST, HEARTBEAT_PORT))
-
-        step = "send"
-        hb_sock.send(packet)
-        print("[%d ms] HEARTBEAT #%d sent (%d bytes)" % (
-            utime.ticks_ms(), hb_seq, len(packet)))
-
+        hb = Heartbeat(DEVICE_ID, HEARTBEAT_HOST, HEARTBEAT_PORT,
+                       HEARTBEAT_INTERVAL_S, HEARTBEAT_KEY_FILE)
     except Exception as e:
-        print("Heartbeat failed at %s: %s %s" % (step, type(e).__name__, e))
-        try:
-            hb_sock.close()
-        except Exception:
-            pass
-        hb_sock = None
+        print("Heartbeat init failed:", e)
 
 
-def maybe_heartbeat(ipv6):
-    if hb_last is None or utime.ticks_diff(
-            utime.ticks_ms(), hb_last) >= HEARTBEAT_INTERVAL_S * 1000:
-        send_heartbeat(ipv6)
+def hb_call(method, *args):
+    # Heartbeat calls never disturb the bridge
+    if hb is None:
+        return
+    try:
+        getattr(hb, method)(*args)
+    except Exception as e:
+        print("Heartbeat error:", e)
 
 
 # -----------------------------------------
@@ -393,7 +316,6 @@ def bridge(client, uart, ipv6):
     # Transparent relay: every TCP byte goes to the meter UART and every
     # UART byte goes to TCP, in both directions, until the client leaves,
     # goes idle, or the IPv6 address changes.
-    global last_meter_rx
     client.settimeout(RECV_POLL_MS / 1000)
     last_activity = utime.ticks_ms()
     last_check = last_activity
@@ -421,7 +343,7 @@ def bridge(client, uart, ipv6):
 
             if burst:
                 last_activity = utime.ticks_ms()
-                last_meter_rx = last_activity
+                hb_call("meter_rx")
                 trace("METER->TCP", burst)
                 send_all(client, burst)
 
@@ -430,7 +352,7 @@ def bridge(client, uart, ipv6):
 
         if utime.ticks_diff(now, last_check) >= CHECK_INTERVAL_S * 1000:
             last_check = now
-            maybe_heartbeat(ipv6)
+            hb_call("maybe", ipv6)
 
             if get_ipv6() != ipv6:
                 raise Exception("IPv6 address changed or PDP lost")
@@ -447,7 +369,7 @@ def bridge(client, uart, ipv6):
 def serve(ipv6, uart):
     # Runs until the socket fails or the IPv6 address changes,
     # then raises so main() can rebind.
-    global connection_count, client_connected
+    global connection_count
 
     server = usocket.socket(
         usocket.AF_INET6,
@@ -463,10 +385,10 @@ def serve(ipv6, uart):
         print("IPv6:", ipv6)
         print("Port:", PORT)
         print("BRIDGE READY")
-        send_heartbeat(ipv6)    # at once: the server learns the address
+        hb_call("send", ipv6)   # at once: the server learns the address
 
         while True:
-            maybe_heartbeat(ipv6)
+            hb_call("maybe", ipv6)
             print("\nWaiting for Vultr client...")
 
             started = utime.ticks_ms()
@@ -489,7 +411,7 @@ def serve(ipv6, uart):
                 continue
 
             connection_count += 1
-            client_connected = True
+            hb_call("set_client", True)
             set_conn_led(True)
 
             print("CONNECTED:", address, remote_port,
@@ -515,7 +437,7 @@ def serve(ipv6, uart):
                 except:
                     pass
 
-                client_connected = False
+                hb_call("set_client", False)
                 set_conn_led(False)
                 print("CLIENT CLOSED")
 

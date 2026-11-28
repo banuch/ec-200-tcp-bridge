@@ -31,7 +31,8 @@ GXDLMSDirector (PC) ──SSH tunnel──► Vultr VM ──IPv6, TCP 4059─�
 ## 2. Module (EC200U) deployment
 
 1. Open the module in QPYcom (USB serial port, e.g. `COM32`, 115200).
-2. Upload `device/main.py` to the module as `/usr/main.py`.
+2. Upload `device/main.py` to the module as `/usr/main.py` and
+   `device/heartbeat.py` as `/usr/heartbeat.py`.
 3. Reboot the module (or run `example.exec('/usr/main.py')` in the REPL).
 4. Check the boot log:
 
@@ -278,7 +279,9 @@ first (or rename it) so both do not use UART2.
 | Path | Contents |
 |---|---|
 | `device/main.py` | production module bridge (`/usr/main.py` on the EC200U) |
+| `device/heartbeat.py` | UDP heartbeat sender (`/usr/heartbeat.py`; without it the bridge runs with heartbeats disabled) |
 | `server/server.py` | VM reader, scheduler, console, PC relay, reconnect logic |
+| `server/heartbeat.py` | heartbeat listener: signature check, live/offline, IPv6 auto-update |
 | `server/dlms_reader.py` | DLMS session, meter login settings, `READ_LIST` of OBIS objects |
 | `server/profile_store.py` | SQLite store for profiles |
 | `server/modules.json` | module names and IPv6 addresses (VM only, not in git) |
